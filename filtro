@@ -1,0 +1,65 @@
+# filters.py (o añadir a un archivo existente de tu app)
+
+INTERNAL_CIDR_RANGES = [
+    '99.0.0.0/8',
+    '55.0.0.0/8',
+    '11.0.0.0/8',
+    '30.0.0.0/8',
+    '33.0.0.0/8',
+    '29.0.0.0/8',
+    '224.0.0.0/8',
+    '155.140.0.0/16',
+    '159.50.0.0/16',
+    '159.95.0.0/16',
+    '172.16.0.0/12',
+    '192.168.0.0/16',
+    '22.0.0.0/8',
+    '10.0.0.0/8',
+]
+
+# Construir la cláusula SQL una sola vez
+_cidr_values = ", ".join(f"'{c}'::cidr" for c in INTERNAL_CIDR_RANGES)
+
+EXTERNAL_ROUTED_SQL = f"""
+(
+    "pf_rule"."vpn_id" IS NULL
+    AND "pf_rule"."nated_source" IS NULL
+    AND "pf_rule"."nated_destination" IS NULL
+    AND "pf_rule"."nated_service" IS NULL
+    AND (
+        (
+            "pf_rule"."source" IS NOT NULL
+            AND EXISTS (
+                SELECT 1
+                FROM jsonb_array_elements_text(
+                    CASE WHEN jsonb_typeof("pf_rule"."source") = 'array'
+                         THEN "pf_rule"."source"
+                         ELSE jsonb_build_array("pf_rule"."source")
+                    END
+                ) AS src(txt)
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM unnest(ARRAY[{_cidr_values}]) AS e(net)
+                    WHERE (src.txt)::cidr << e.net
+                )
+            )
+        )
+        OR
+        (
+            "pf_rule"."destination" IS NOT NULL
+            AND EXISTS (
+                SELECT 1
+                FROM jsonb_array_elements_text(
+                    CASE WHEN jsonb_typeof("pf_rule"."destination") = 'array'
+                         THEN "pf_rule"."destination"
+                         ELSE jsonb_build_array("pf_rule"."destination")
+                    END
+                ) AS dst(txt)
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM unnest(ARRAY[{_cidr_values}]) AS e(net)
+                    WHERE (dst.txt)::cidr << e.net
+                )
+            )
+        )
+    )
+)
+"""
