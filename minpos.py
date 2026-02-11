@@ -3,7 +3,7 @@ def filter_min_position_open(data, fw_and_node_info):
     """
     Para cada flujo único (fw_tag, port, source_ip, destination_ip),
     encuentra la regla con la posición más baja (la que el firewall aplicará primero).
-    Luego agrupa los resultados por (fw_tag, port) para la visualización,
+    Luego agrupa los resultados por la regla ganadora (fw_tag, port, id) para visualización,
     y genera to_code para las reglas con acción 'drop'.
     """
     if not fw_and_node_info:
@@ -18,14 +18,12 @@ def filter_min_position_open(data, fw_and_node_info):
         s_ip = item.get('source_ip')
         d_ip = item.get('destination_ip')
 
-        # Verificar si el firewall tag coincide con el dueño del source o destination
         owner_fw_src = fw_and_node_info.get(s_ip, {}).get('firewall_misc', "").strip()
         owner_fw_dst = fw_and_node_info.get(d_ip, {}).get('firewall_misc', "").strip()
 
         if current_fw_tag != owner_fw_src and current_fw_tag != owner_fw_dst:
             continue
 
-        # Convertir posición a entero
         try:
             current_position = int(item.get('position', 0))
         except (ValueError, TypeError):
@@ -48,17 +46,18 @@ def filter_min_position_open(data, fw_and_node_info):
                 'destination_node_name': item.get('destination_node_name'),
             }
 
-    # Paso 2: Agrupar por (fw_tag, port) para visualización
-    display_groups = {}  # key: (fw_tag, port) -> datos agrupados
+    # Paso 2: Agrupar por REGLA ganadora (tag, port, position, id)
+    # Así cada regla distinta mantiene sus propios sources/destinations
+    display_groups = {}
 
     for flow_key, rule in flow_min.items():
-        fw_tag, port = rule['tag'], rule['port']
-        group_key = (fw_tag, port)
+        # La clave de agrupación es la identidad de la regla, no solo tag+port
+        group_key = (rule['tag'], rule['port'], rule['position'], rule['id'])
 
         if group_key not in display_groups:
             display_groups[group_key] = {
-                'tag': fw_tag,
-                'port': port,
+                'tag': rule['tag'],
+                'port': rule['port'],
                 'position': rule['position'],
                 'action': rule['action'],
                 'section': rule['section'],
@@ -72,27 +71,20 @@ def filter_min_position_open(data, fw_and_node_info):
 
         group = display_groups[group_key]
 
-        # Si esta regla tiene posición menor, reemplazar todo
-        if rule['position'] < group['position']:
-            group['position'] = rule['position']
-            group['action'] = rule['action']
-            group['section'] = rule['section']
-            group['comment'] = rule['comment']
-            group['id'] = rule['id']
-            group['source'] = [{'ip': rule['s_ip'], 'node_name': rule['source_node_name']}]
-            group['destination'] = [{'ip': rule['d_ip'], 'node_name': rule['destination_node_name']}]
-            group['_source_ips_seen'] = {rule['s_ip']}
-            group['_dest_ips_seen'] = {rule['d_ip']}
+        # Agregar IPs sin duplicar
+        if rule['s_ip'] not in group['_source_ips_seen']:
+            group['_source_ips_seen'].add(rule['s_ip'])
+            group['source'].append({
+                'ip': rule['s_ip'],
+                'node_name': rule['source_node_name'],
+            })
 
-        elif rule['position'] == group['position']:
-            # Misma posición mínima: agregar IPs sin duplicar
-            if rule['s_ip'] not in group['_source_ips_seen']:
-                group['_source_ips_seen'].add(rule['s_ip'])
-                group['source'].append({'ip': rule['s_ip'], 'node_name': rule['source_node_name']})
-
-            if rule['d_ip'] not in group['_dest_ips_seen']:
-                group['_dest_ips_seen'].add(rule['d_ip'])
-                group['destination'].append({'ip': rule['d_ip'], 'node_name': rule['destination_node_name']})
+        if rule['d_ip'] not in group['_dest_ips_seen']:
+            group['_dest_ips_seen'].add(rule['d_ip'])
+            group['destination'].append({
+                'ip': rule['d_ip'],
+                'node_name': rule['destination_node_name'],
+            })
 
     # Paso 3: Construir to_code para reglas con acción 'drop'
     to_code = {}
@@ -106,7 +98,6 @@ def filter_min_position_open(data, fw_and_node_info):
                     'destinations': set(),
                     'services': set(),
                 }
-            # Agregar TODAS las IPs, no solo la primera
             for src in group['source']:
                 to_code[fw_tag]['sources'].add(src['ip'])
             for dst in group['destination']:
@@ -116,7 +107,6 @@ def filter_min_position_open(data, fw_and_node_info):
     # Paso 4: Preparar resultado final
     result = []
     for group in display_groups.values():
-        # Eliminar sets auxiliares y convertir posición a string
         group.pop('_source_ips_seen', None)
         group.pop('_dest_ips_seen', None)
         group['position'] = str(group['position'])
@@ -133,3 +123,4 @@ def filter_min_position_open(data, fw_and_node_info):
             for tag, details in to_code.items()
         },
     }
+
