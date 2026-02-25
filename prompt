@@ -1,0 +1,67 @@
+Tengo un proyecto Django con JavaScript jQuery. 
+Necesito que modifiques el handler de submit de un formulario.
+
+CONTEXTO:
+- Hay un formulario con id "id_avi_waf_request_form"
+- Los filtros son CHECKBOXES (no inputs de texto)
+- Cada grupo de checkboxes tiene un "select-all" que hay que excluir
+
+TAREA:
+Reemplaza el handler de submit actual por uno nuevo que:
+1. Lea los checkboxes marcados de cada filtro
+2. Excluya el checkbox "select-all" de cada grupo
+3. Envíe los valores por AJAX GET
+4. Muestre/oculte loader y card correctamente
+
+EJEMPLO DE PATRÓN que debes repetir para cada filtro:
+$('input[type=checkbox][name=NOMBRE_FILTRO]:checkbox:checked')
+    .not('#select-all-NOMBRE_FILTRO').each(function (i) {
+    if (!request_params['NOMBRE_FILTRO']) request_params['NOMBRE_FILTRO'] = [];
+    request_params['NOMBRE_FILTRO'].push($(this).val());
+});
+
+LISTA DE FILTROS que debes incluir 
+(nombre del checkbox → id del select-all):
+- tenant → #select-all-tenant
+- vs_ip → #select-all-vs-ip
+- application_profile → #select-all-app-profile
+- error_page_profile → #select-all-error-page
+- waf_profile → #select-all-waf-profile
+- waf_policy → #select-all-waf-policy
+- waf_crs → #select-all-waf-crs
+- waf_paranoia_level → #select-all-waf-paranoia
+- waf_policy_mode → #select-all-waf-policy-mode
+- region → #select-all-region
+- vs_name → #select-all-vs-name
+- vs_status → #select-all-vs-status
+- env → #select-all-env
+- services → #select-all-services
+- pool_server → #select-all-pool-server
+
+LA LLAMADA AJAX debe ser:
+$.ajax({
+    method: 'GET',
+    url: '{% url "ajax_get_avi_waf_data" %}',
+    data: request_params,
+    beforeSend: function (xhr) {
+        $_waf_card.hide();
+        $_waf_loader.show();
+    },
+    success: function (response) {
+        $_waf_loader.hide();
+        $_waf_card.html(response.html).show();
+        let data_iv2 = response.avi2_data;
+        let labels_iv2 = response.labels_iv2;
+        updateChartsAndTables(data_iv2, data_iv1_default, labels_iv2);
+    },
+    error: function (xhr) {
+        console.error('Error applying filters:', xhr.responseText);
+        $_waf_loader.hide();
+    }
+});
+
+IMPORTANTE:
+- No cambies nada más del archivo
+- El resultado debe ser solo el bloque 
+  $('#id_avi_waf_request_form').submit(function(event){...});
+  completo y listo para copiar
