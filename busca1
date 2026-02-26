@@ -1,0 +1,33 @@
+-- ============================================================
+-- Buscar reglas que tengan en source o destination
+-- exactamente 11.0.196.0/22 o IPs/redes DENTRO de esa red
+-- Excluye 0.0.0.0/0 (any/any) y 10.0.0.0/8
+-- ============================================================
+
+SELECT DISTINCT
+    rule_id,
+    comment,
+    action,
+    status,
+    source,
+    destination,
+    service,
+    section
+FROM pf_rule,
+     LATERAL jsonb_array_elements_text(COALESCE(source, '[]'::jsonb))      AS src(val),
+     LATERAL jsonb_array_elements_text(COALESCE(destination, '[]'::jsonb)) AS dst(val)
+WHERE
+    (
+        src.val ~ '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}(/[0-9]{1,2})?$'
+        AND src.val != '0.0.0.0/0'
+        AND src.val != '10.0.0.0/8'
+        AND src.val::inet <<= '11.0.196.0/22'   -- src es exactamente la red o está dentro de ella
+    )
+    OR
+    (
+        dst.val ~ '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}(/[0-9]{1,2})?$'
+        AND dst.val != '0.0.0.0/0'
+        AND dst.val != '10.0.0.0/8'
+        AND dst.val::inet <<= '11.0.196.0/22'   -- dst es exactamente la red o está dentro de ella
+    )
+ORDER BY rule_id;
