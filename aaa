@@ -1,0 +1,297 @@
+"""
+Django view helper: agrupa reglas de firewall por (tag, position)
+y también genera el dict to_code para reglas drop agrupadas por tag.
+
+Output format compatible con el template check_flow_open.html:
+  - rule.sources = dict { "ip": {"node_name": "..."}, ... }
+  - rule.destinations = dict { "ip": {"node_name": "..."}, ... }
+  - rule.services = list ["tcp-1521", ...]
+"""
+
+from collections import OrderedDict
+
+
+def group_firewall_rules(rules_list):
+    """
+    Devuelve:
+    {
+        "grouped_rules": [
+            {
+                "fw_policy": "EMEA_...",
+                "rule_position": "128",
+                "rule_id": "388",
+                "action": "accept",
+                "section": "NETSEC:...",
+                "comment": "UCM V2...",
+                "sources": {
+                    "11.4.0.0/20": {"node_name": "EMEA_...-CIB-USERS"},
+                    "11.4.16.0/21": {"node_name": "EMEA_...-CIB-IT-USERS"},
+                },
+                "destinations": {
+                    "55.39.193.201/32": {"node_name": "EMEA_ITG"},
+                },
+                "services": ["tcp-1521"],
+            },
+            ...
+        ],
+        "to_code": {
+            "tag_name": {
+                "sources": [...],
+                "destinations": [...],
+                "services": [...]
+            }
+        }
+    }
+    """
+    grouped = OrderedDict()
+    to_code = {}
+
+    for rule in rules_list:
+        tag = rule.get("tag", "")
+        position = rule.get("position", "")
+        action = rule.get("action", "")
+
+        # -----------------------------------------------------------
+        # 1) Agrupación por (tag, position) para el render HTML
+        # -----------------------------------------------------------
+        key = (tag, position)
+
+        if key not in grouped:
+            grouped[key] = {
+                "fw_policy": tag,
+                "rule_position": position,
+                "rule_id": rule.get("id", ""),
+                "action": action,
+                "section": rule.get("section", ""),
+                "comment": rule.get("comment", ""),
+                "type": rule.get("type", ""),
+                # Dicts para acumular (ip -> node_name)
+                "_sources": {},      # {"ip": "node_name"}
+                "_destinations": {}, # {"ip": "node_name"}
+                "_services": set(),
+            }
+
+        entry = grouped[key]
+
+        # --- Source principal ---
+        source_ip = rule.get("source", "")
+        source_node = rule.get("source_node_name", "")
+        if source_ip and source_ip not in entry["_sources"]:
+            entry["_sources"][source_ip] = source_node
+
+        # --- Sources array (pueden ser dicts, tuplas o strings) ---
+        sources_arr = rule.get("sources", []) or []
+        source_nodes_arr = rule.get("source_nodes", []) or []
+        for i, src in enumerate(sources_arr):
+            src_ip, src_name = _extract_ip_name(src, i, source_nodes_arr)
+            if src_ip and src_ip not in entry["_sources"]:
+                entry["_sources"][src_ip] = src_name
+
+        # --- Destination principal ---
+        dest_ip = rule.get("destination", "")
+        dest_node = rule.get("destination_node_name", "")
+        if dest_ip and dest_ip not in entry["_destinations"]:
+            entry["_destinations"][dest_ip] = dest_node
+
+        # --- Destinations array ---
+        destinations_arr = rule.get("destinations", []) or []
+        dest_nodes_arr = rule.get("destination_nodes", []) or []
+        for i, dst in enumerate(destinations_arr):
+            dst_ip, dst_name = _extract_ip_name(dst, i, dest_nodes_arr)
+            if dst_ip and dst_ip not in entry["_destinations"]:
+                entry["_destinations"][dst_ip] = dst_name
+
+        # --- Services ---
+        service = rule.get("service", "")
+        if service:
+            entry["_services"].add(service)
+
+        services_arr = rule.get("services", []) or []
+        for svc in services_arr:
+            svc_name = svc if isinstance(svc, str) else svc.get("name", str(svc))
+            entry["_services"].add(svc_name)
+
+        # -----------------------------------------------------------
+        # 2) to_code: solo reglas DROP, agrupadas por tag
+        # -----------------------------------------------------------
+        if action == "drop":
+            if tag not in to_code:
+                to_code[tag] = {
+                    "sources": set(),
+                    "destinations": set(),
+                    "services": set(),
+                }
+
+            flow = rule.get("flow", "")
+            if flow:
+                parts = flow.split()
+                if len(parts) >= 1:
+                    to_code[tag]["sources"].add(parts[0])
+                if len(parts) >= 2:
+                    to_code[tag]["destinations"].add(parts[1])
+                if len(parts) >= 3:
+                    to_code[tag]["services"].add(parts[2])
+
+    # -----------------------------------------------------------
+    # Finalizar: convertir al formato que espera el template
+    # -----------------------------------------------------------
+    grouped_rules = []
+    for key, entry in grouped.items():
+        # sources: dict { "ip": {"node_name": "..."} }
+        # para que en el template funcione:
+        #   {% for src_ip, src_info in rule.sources.items %}
+        #       {{ src_ip }} -> {{ src_info.node_name|default:'-' }}
+        entry["sources"] = {
+            ip: {"node_name": name}
+            for ip, name in sorted(entry["_sources"].items())
+        }
+        entry["destinations"] = {
+            ip: {"node_name": name}
+            for ip, name in sorted(entry["_destinations"].items())
+        }
+        entry["services"] = sorted(entry["_services"])
+
+        del entry["_sources"]
+        del entry["_destinations"]
+        del entry["_services"]
+        grouped_rules.append(entry)
+
+    # to_code
+    processed_to_code = {
+        tag: {
+            "sources": sorted(list(details["sources"])),
+            "destinations": sorted(list(details["destinations"])),
+            "services": sorted(list(details["services"])),
+        }
+        for tag, details in to_code.items()
+    }
+
+    return {
+        "grouped_rules": grouped_rules,
+        "to_code": processed_to_code,
+    }
+
+
+def _extract_ip_name(item, index, nodes_arr):
+    """
+    Extrae (ip, node_name) de un item que puede ser:
+    - str:   "11.4.0.0/20"
+    - tuple: ("11.4.0.0/20", "NODE_NAME")
+    - dict:  {"ip": "11.4.0.0/20", "node_name": "NODE_NAME"}
+    """
+    if isinstance(item, dict):
+        ip = item.get("ip", item.get("address", ""))
+        name = item.get("node_name", item.get("name", ""))
+        return ip, name
+    elif isinstance(item, (tuple, list)) and len(item) >= 2:
+        return str(item[0]), str(item[1])
+    else:
+        ip = str(item)
+        name = ""
+        if index < len(nodes_arr):
+            node = nodes_arr[index]
+            name = node if isinstance(node, str) else node.get("name", str(node))
+        return ip, name
+
+
+# ---------------------------------------------------------------
+# Ejemplo de uso en views.py:
+#
+#   data = group_firewall_rules(result)
+#   # data["grouped_rules"] -> para item.match_flow_results en el template
+#   # data["to_code"]       -> para procesar drops
+# ---------------------------------------------------------------
+
+
+if __name__ == "__main__":
+    sample_rules = [
+        {
+            "tag": "EMEA_IT_PRD_DMZA_CAMPUS",
+            "section": "NETSEC:UCM V2 COMPLIANT ENTITIES",
+            "id": "388", "action": "accept", "type": "match-flow",
+            "position": "128",
+            "comment": "UCM V2 COMPLIANT ENTITIES RULE. IMPTSK0093192",
+            "flow": "11.4.0.0/20 55.39.19 tcp-1521",
+            "source": "11.4.0.0/20",
+            "source_node_name": "EMEA_IT_PRD_DMZA_CAMPUS-CIB-USERS",
+            "destination": "55.39.193.201/32",
+            "destination_node_name": "EMEA_ITG",
+            "service": "tcp-1521",
+            "sources": [
+                {"ip": "11.4.44.0/23", "node_name": "EMEA_IT_PRD_DMZA_CAMPUS-AM-IT-USERS"},
+            ],
+            "destinations": [], "services": ["tcp-1521"],
+            "source_nodes": [], "destination_nodes": [],
+        },
+        {
+            "tag": "EMEA_IT_PRD_DMZA_CAMPUS",
+            "section": "NETSEC:UCM V2 COMPLIANT ENTITIES",
+            "id": "388", "action": "accept", "type": "match-flow",
+            "position": "128",
+            "comment": "UCM V2 COMPLIANT ENTITIES RULE. IMPTSK0093192",
+            "flow": "11.4.16.0/21 55.39.193.20 tcp-1521",
+            "source": "11.4.16.0/21",
+            "source_node_name": "EMEA_IT_PRD_DMZA_CAMPUS-CIB-IT-USERS",
+            "destination": "55.39.193.201/32",
+            "destination_node_name": "EMEA_ITG",
+            "service": "tcp-1521",
+            "sources": [], "destinations": [], "services": ["tcp-1521"],
+            "source_nodes": [], "destination_nodes": [],
+        },
+        {
+            "tag": "EMEA_IT_PRD_DMZA_CAMPUS",
+            "section": "APPLI:LEGACY - COMMON",
+            "id": "441", "action": "accept", "type": "match-flow",
+            "position": "174",
+            "comment": "SN603565",
+            "flow": "11.4.0.0/20 55.39.193.201/32 tcp-1521",
+            "source": "11.4.0.0/20",
+            "source_node_name": "EMEA_IT_PRD_DMZA_CAMPUS-CIB-USERS",
+            "destination": "55.39.193.201/32",
+            "destination_node_name": "EMEA_ITG",
+            "service": "tcp-1521",
+            "sources": [
+                {"ip": "10.1.0.0/16", "node_name": "ANOTHER-NET"},
+                {"ip": "10.2.0.0/16", "node_name": "ANOTHER-NET-2"},
+            ],
+            "destinations": [], "services": ["tcp-1521"],
+            "source_nodes": [], "destination_nodes": [],
+        },
+        {
+            "tag": "EMEA_IT_PRD_DMZA_CAMPUS",
+            "section": "BLOCKED", "id": "500",
+            "action": "drop", "type": "match-flow", "position": "200",
+            "comment": "DROP RULE",
+            "flow": "10.0.0.0/8 55.39.193.201/32 tcp-443",
+            "source": "10.0.0.0/8", "source_node_name": "INTERNAL",
+            "destination": "55.39.193.201/32", "destination_node_name": "EMEA_ITG",
+            "service": "tcp-443",
+            "sources": [], "destinations": [], "services": [],
+            "source_nodes": [], "destination_nodes": [],
+        },
+    ]
+
+    data = group_firewall_rules(sample_rules)
+
+    print("=" * 60)
+    print("GROUPED RULES (formato para template Django)")
+    print("=" * 60)
+    for r in data["grouped_rules"]:
+        print(f"\n--- {r['fw_policy']} | Pos: {r['rule_position']} | ID: {r['rule_id']} | Action: {r['action']} ---")
+        print(f"  Section: {r['section']} | Comment: {r['comment']}")
+        print(f"  sources (dict):")
+        for ip, info in r["sources"].items():
+            print(f"    {ip} -> {info['node_name']}")
+        print(f"  destinations (dict):")
+        for ip, info in r["destinations"].items():
+            print(f"    {ip} -> {info['node_name']}")
+        print(f"  services: {r['services']}")
+
+    print("\n" + "=" * 60)
+    print("TO_CODE (reglas DROP por tag)")
+    print("=" * 60)
+    for tag, d in data["to_code"].items():
+        print(f"\n--- {tag} ---")
+        print(f"  Sources:      {d['sources']}")
+        print(f"  Destinations: {d['destinations']}")
+        print(f"  Services:     {d['services']}")
