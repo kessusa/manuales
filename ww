@@ -1,0 +1,304 @@
+import urllib3
+from contextlib import contextmanager
+from requests import session
+
+from bookmark.settings import (
+    IWAF_API_VERSION,
+    HTTP_PROXY,
+    IWAF_URL,
+    get_iwaf_auth_credentials,
+    get_apac_iwaf_auth_credentials,
+    get_iwaf_rw_auth_credentials,
+    APAC_IWAF_URL,
+)
+
+urllib3.disable_warnings()
+
+GROUPS_KEY = {"pre_crs": "pre_crs_groups", "crs": "crs_overrides"}
+RULES_KEY = {"pre_crs": "rules", "crs": "rule_overrides"}
+
+
+# ---------------------------------------------------------------------------
+# Pure helpers (no `self` needed)
+# ---------------------------------------------------------------------------
+
+def _find_by_name(items, name):
+    return next((item for item in items if item.get("name") == name), None)
+
+
+def _find_rule(rules, rule_id=None, rule_name=None):
+    if rule_id:
+        match = next((r for r in rules if r.get("rule_id") == rule_id), None)
+        if match:
+            return match
+    if rule_name:
+        return next((r for r in rules if r.get("name") == rule_name), None)
+    return None
+
+
+def _reindex(items):
+    for index, item in enumerate(items):
+        item["index"] = index
+
+
+def _create_item(container, **fields):
+    """
+    Append a new dict to `container` with `enable=True` and `index=len(container)`,
+    plus any truthy keyword fields. Replaces the old _create_group / _create_rule.
+
+    Examples:
+        _create_item(groups, name="my_group")
+        _create_item(rules, rule_id="942100", name="SQLi")
+    """
+    item = {"enable": True, "index": len(container)}
+    item.update({k: v for k, v in fields.items() if v})
+    container.append(item)
+    return item
+
+
+def _get_exclusion_id(exclusion):
+    if "rule_id" in exclusion:
+        return f"rule_{exclusion['rule_id']}"
+    if "uri_path" in exclusion:
+        return f"uri_{exclusion['uri_path']}"
+    if "client_subnet" in exclusion:
+        return f"ip_{exclusion['client_subnet']['ip_addr']['addr']}"
+    return str(hash(frozenset(exclusion.items())))
+
+
+def _add_exclusion(container, exclusion_data):
+    container.setdefault("exclude_list", [])
+    new_id = _get_exclusion_id(exclusion_data)
+    existing_ids = {_get_exclusion_id(item) for item in container["exclude_list"]}
+    if new_id in existing_ids:
+        return False
+    container["exclude_list"].append(exclusion_data)
+    return True
+
+
+def _delete_exclusion(exclude_list, exclusion_id):
+    idx = next(
+        (i for i, e in enumerate(exclude_list) if _get_exclusion_id(e) == exclusion_id),
+        None,
+    )
+    # NOTE: keep `is None` here — idx can legitimately be 0
+    if idx is None:
+        return False
+    exclude_list.pop(idx)
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Main class
+# ---------------------------------------------------------------------------
+
+class AVIIWAFApi:
+    def __init__(self, env="emea", mode="read"):
+        if env == "emea":
+            if mode == "read":
+                self.auth_credentials = get_iwaf_auth_credentials()
+                self.base_url = IWAF_URL
+            elif mode == "write":
+                self.auth_credentials = get_iwaf_rw_auth_credentials()
+                self.base_url = IWAF_URL
+        else:
+            self.auth_credentials = get_apac_iwaf_auth_credentials()
+            self.base_url = APAC_IWAF_URL
+
+        self.api_version = IWAF_API_VERSION
+        self.http_proxy = HTTP_PROXY
+
+        self.headers = {
+            "accept": "application/json",
+            "X-Avi-Version": self.api_version,
+        }
+
+    @contextmanager
+    def login(self, tenant):
+        Session = session()
+        Session.verify = False
+        Session.headers = self.headers
+        Session.auth = self.auth_credentials
+        Session.trust_env = False
+
+        # NOTE: csrf retrieval — adjust to your real flow if different
+        csrf = Session.get(f"{self.base_url}/api/login").cookies.get("csrftoken", "")
+
+        Session.headers.update({
+            "X-Avi-Tenant": tenant,
+            "X-Avi-Version": self.api_version,
+            "X-CSRFToken": csrf,
+            "accept": "application/json",
+        })
+
+        try:
+            yield Session
+        finally:
+            Session.close()
+
+    def get_data(self):
+        ...  # unchanged from original
+
+    # ---------------- Public API: groups ----------------
+
+    def modify_group_status(self, tenant, policy_name, group_name, enable,
+                            group_type="pre_crs"):
+        """Replaces enable_group / disable_group. Pass enable=True or False."""
+        return self._modify_policy(
+            tenant, policy_name, group_name, group_type, enable=enable
+        )
+
+    def delete_group(self, tenant, policy_name, group_name, group_type="pre_crs"):
+        return self._modify_policy(
+            tenant, policy_name, group_name, group_type, delete=True
+        )
+
+    def add_group_exclusion(self, tenant, policy_name, group_name, exclusion_data,
+                            group_type="pre_crs"):
+        return self._modify_policy(
+            tenant, policy_name, group_name, group_type, new_exclusion=exclusion_data
+        )
+
+    def delete_group_exclusion(self, tenant, policy_name, group_name, exclusion_id,
+                               group_type="pre_crs"):
+        return self._modify_policy(
+            tenant, policy_name, group_name, group_type,
+            exclusion_to_delete=exclusion_id,
+        )
+
+    # ---------------- Public API: rules ----------------
+
+    def modify_rule_status(self, tenant, policy_name, group_name, enable,
+                           rule_id=None, rule_name=None, rule_data=None,
+                           group_type="pre_crs"):
+        """Replaces enable_rule / disable_rule. Pass enable=True or False."""
+        return self._modify_policy(
+            tenant, policy_name, group_name, group_type,
+            rule_id=rule_id, rule_name=rule_name,
+            enable=enable, data=rule_data,
+        )
+
+    def delete_rule(self, tenant, policy_name, group_name,
+                    rule_id=None, rule_name=None, group_type="pre_crs"):
+        return self._modify_policy(
+            tenant, policy_name, group_name, group_type,
+            rule_id=rule_id, rule_name=rule_name, delete=True,
+        )
+
+    def modify_rule_mode(self, tenant, policy_name, group_name, rule_id, new_mode,
+                         group_type="crs"):
+        return self._modify_policy(
+            tenant, policy_name, group_name, group_type,
+            rule_id=rule_id, data={"mode": new_mode},
+        )
+
+    def add_rule_exclusion(self, tenant, policy_name, group_name, rule_id,
+                           exclusion_data, group_type="crs"):
+        return self._modify_policy(
+            tenant, policy_name, group_name, group_type,
+            rule_id=rule_id, new_exclusion=exclusion_data,
+        )
+
+    def delete_rule_exclusion(self, tenant, policy_name, group_name, rule_id,
+                              exclusion_id, group_type="crs"):
+        return self._modify_policy(
+            tenant, policy_name, group_name, group_type,
+            rule_id=rule_id, exclusion_to_delete=exclusion_id,
+        )
+
+    # ---------------- Internals ----------------
+
+    def _ensure_group(self, Session, policy, groups, group_name, group_type):
+        """Either pull the group from the CRS catalog or create a fresh local one."""
+        if group_type == "crs":
+            return self._ensure_crs_override(Session, policy, groups, group_name)
+        return _create_item(groups, name=group_name)
+
+    def _ensure_crs_override(self, Session, policy, overrides, group_name):
+        existing = _find_by_name(overrides, group_name)
+        if existing:
+            return existing
+
+        waf_crs_url = f"{self.base_url}/api/wafcrs"
+        waf_crs = Session.get(waf_crs_url).json()
+        if not any(g.get("name") == group_name for g in waf_crs.get("groups", [])):
+            return None
+
+        return _create_item(overrides, name=group_name)
+
+    def _modify_policy(self, tenant, policy_name, group_name, group_type,
+                       rule_id=None, rule_name=None,
+                       enable=None, delete=False, data=None,
+                       new_exclusion=None, exclusion_to_delete=None):
+        """
+        Unified modifier for both groups and rules within a WAF policy.
+
+        If `rule_id` or `rule_name` is given, the operation targets a rule
+        inside the named group. Otherwise it targets the group itself.
+        """
+        target_is_rule = bool(rule_id or rule_name)
+
+        with self.login(tenant) as Session:
+            try:
+                # Fetch policy (inlined)
+                vs_url = f"{self.base_url}/api/wafpolicy?name={policy_name}"
+                results = Session.get(vs_url).json().get("results") or []
+                if not results:
+                    return False
+                policy = results[0]
+
+                groups = policy.setdefault(GROUPS_KEY[group_type], [])
+                group = _find_by_name(groups, group_name)
+
+                # Resolve container + item depending on target
+                if target_is_rule:
+                    if not group:
+                        group = self._ensure_group(
+                            Session, policy, groups, group_name, group_type
+                        )
+                        if not group:
+                            return False
+                    container = group.setdefault(RULES_KEY[group_type], [])
+                    item = _find_rule(container, rule_id, rule_name)
+
+                    if not item and not delete and not exclusion_to_delete:
+                        item = _create_item(container, rule_id=rule_id, name=rule_name)
+                else:
+                    container = groups
+                    item = group
+                    if not item and not delete and not exclusion_to_delete:
+                        item = self._ensure_group(
+                            Session, policy, groups, group_name, group_type
+                        )
+                        if not item:
+                            return False
+
+                # Apply the requested mutation
+                if delete:
+                    if not item:
+                        return False
+                    container.remove(item)
+
+                elif exclusion_to_delete:
+                    if not item or "exclude_list" not in item:
+                        return False
+                    if not _delete_exclusion(item["exclude_list"], exclusion_to_delete):
+                        return False
+
+                else:
+                    if data:
+                        item.update(data)
+                    if new_exclusion and not _add_exclusion(item, new_exclusion):
+                        return False
+                    # NOTE: keep `is not None` — `enable` is a bool, False is meaningful
+                    if enable is not None:
+                        item["enable"] = enable
+
+                _reindex(container)
+
+                # Save policy (inlined)
+                put_url = f"{self.base_url}/api/wafpolicy/{policy['uuid']}"
+                return Session.put(put_url, json=policy).status_code == 200
+
+            except Exception:
+                return False
