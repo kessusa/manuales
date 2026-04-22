@@ -1,0 +1,464 @@
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/izitoast@1.4.0/dist/css/iziToast.min.css">
+<script src="https://cdn.jsdelivr.net/npm/izitoast@1.4.0/dist/js/iziToast.min.js"></script>
+
+<style>
+  .modal-xxl {
+    max-width: min(95vw, 1400px);
+  }
+</style>
+
+<div class="modal-header bg-primary text-white">
+    <h5 class="modal-title d-flex align-items-center gap-2">
+        <i class="fa fa-shield-alt"></i>
+        Modify WAF Rules
+    </h5>
+    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
+</div>
+
+<form method="post" action="{% url 'avi_rule_modify' %}" id="waf-rules-form" novalidate>
+    {% csrf_token %}
+
+    <div class="modal-body bg-body-tertiary">
+
+        <div class="card shadow-sm mb-3">
+            <div class="card-body">
+                <div class="small text-uppercase text-body-secondary fw-semibold mb-3">
+                    <i class="fa fa-fingerprint text-primary me-1"></i>
+                    Rule identification
+                </div>
+
+                <div class="row g-3">
+                    <div class="col-md-6">
+                        <div class="form-floating">
+                            {{ form.rule_id }}
+                            <label for="{{ form.rule_id.id_for_label }}">
+                                {{ form.rule_id.label }}
+                            </label>
+                        </div>
+                        <div class="form-text">Example: 9002140</div>
+                        {% if form.rule_id.errors %}
+                            <div class="invalid-feedback d-block">{{ form.rule_id.errors|join:", " }}</div>
+                        {% endif %}
+                    </div>
+
+                    <div class="col-md-6">
+                        <div class="form-floating">
+                            {{ form.group_name }}
+                            <label for="{{ form.group_name.id_for_label }}">
+                                {{ form.group_name.label }}
+                            </label>
+                        </div>
+                        <div class="form-text">Example: CRS_901_Initialization</div>
+                        {% if form.group_name.errors %}
+                            <div class="invalid-feedback d-block">{{ form.group_name.errors|join:", " }}</div>
+                        {% endif %}
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="card shadow-sm mb-3">
+            <div class="card-body">
+                <label class="small text-uppercase text-body-secondary fw-semibold mb-3 d-block">
+                    <i class="fa fa-layer-group text-primary me-1"></i>
+                    {{ form.group_type.label }}
+                    <i class="far fa-question-circle text-secondary ms-1"
+                       data-bs-toggle="tooltip"
+                       title="PRE-CRS: Custom rules | CRS: Core Rule Set"></i>
+                </label>
+
+                <div class="d-flex flex-wrap gap-3">
+                    {% for choice in form.group_type %}
+                        <div class="form-check">
+                            {{ choice.tag }}
+                            <label class="form-check-label" for="{{ choice.id_for_label }}">
+                                {{ choice.choice_label }}
+                            </label>
+                        </div>
+                    {% endfor %}
+                </div>
+            </div>
+        </div>
+
+        <div class="card shadow-sm mb-3">
+            <div class="card-body">
+                <label class="small text-uppercase text-body-secondary fw-semibold mb-3 d-block">
+                    <i class="fa fa-bolt text-primary me-1"></i>
+                    {{ form.action.label }}
+                    <i class="far fa-question-circle text-secondary ms-1"
+                       data-bs-toggle="tooltip"
+                       title="Add Rule: New rule | Add Exclusion: Exclusion | Enable/Disable: Activate or deactivate"></i>
+                </label>
+
+                <div class="d-flex flex-wrap gap-3">
+                    {% for choice in form.action %}
+                        <div class="form-check">
+                            {{ choice.tag }}
+                            <label class="form-check-label" for="{{ choice.id_for_label }}">
+                                {{ choice.choice_label }}
+                            </label>
+                        </div>
+                    {% endfor %}
+                </div>
+            </div>
+        </div>
+
+        <div class="card shadow-sm mb-3">
+            <div class="card-body">
+                <label class="small text-uppercase text-body-secondary fw-semibold mb-3 d-block">
+                    <i class="fa fa-sliders-h text-primary me-1"></i>
+                    {{ form.mode.label }}
+                    <i class="far fa-question-circle text-secondary ms-1"
+                       data-bs-toggle="tooltip"
+                       title="Enforcement: Block attacks | Detection: Only log"></i>
+                </label>
+
+                <div class="d-flex flex-wrap gap-3">
+                    {% for choice in form.mode %}
+                        <div class="form-check">
+                            {{ choice.tag }}
+                            <label class="form-check-label" for="{{ choice.id_for_label }}">
+                                {{ choice.choice_label }}
+                            </label>
+                        </div>
+                    {% endfor %}
+                </div>
+            </div>
+        </div>
+
+        <div class="card shadow-sm mb-3">
+            <div class="card-body">
+                <label class="small text-uppercase text-body-secondary fw-semibold mb-3 d-block">
+                    <i class="fa fa-code text-primary me-1"></i>
+                    {{ form.exclusion_data.label }}
+                    <i class="far fa-question-circle text-secondary ms-1"
+                       data-bs-toggle="tooltip"
+                       title="Use JSON for exclusions or custom rule definitions"></i>
+                </label>
+
+                <ul class="nav nav-tabs mb-3" id="exclusionExamplesTab" role="tablist">
+                    <li class="nav-item" role="presentation">
+                        <button class="nav-link active" id="exclusion-uri-tab"
+                                data-bs-toggle="tab" data-bs-target="#exclusion-uri"
+                                type="button" role="tab">
+                            <i class="fa fa-ban me-1"></i> Exception Example
+                        </button>
+                    </li>
+                    <li class="nav-item" role="presentation">
+                        <button class="nav-link" id="add-rule-tab"
+                                data-bs-toggle="tab" data-bs-target="#add-rule"
+                                type="button" role="tab">
+                            <i class="fa fa-plus-circle me-1"></i> Rule Example
+                        </button>
+                    </li>
+                </ul>
+
+                <div class="tab-content mb-3">
+                    <div class="tab-pane fade show active" id="exclusion-uri" role="tabpanel">
+<pre class="bg-dark text-light rounded p-3 small mb-0"><code>{
+  "uri_path": "/admin",
+  "match_element": "REQUEST_HEADERS:User-Agent",
+  "match_element_criteria": {
+    "match_case": "INSENSITIVE",
+    "match_op": "REGEX_MATCH"
+  }
+}</code></pre>
+                    </div>
+                    <div class="tab-pane fade" id="add-rule" role="tabpanel">
+<pre class="bg-dark text-light rounded p-3 small mb-0"><code>{
+  "enable": true,
+  "is_sensitive": true,
+  "mode": "WAF_MODE_ENFORCEMENT",
+  "name": "React_CVE_Block_Rule_2",
+  "rule": "SecRule TX:is_react_action \"@unconditionalMatch\" \"id:500001, phase:2, block, t:none, msg:'React CVE Exploit Attempt', log, severity:1\""
+}</code></pre>
+                    </div>
+                </div>
+
+                <div class="form-floating">
+                    {{ form.exclusion_data }}
+                    <label for="{{ form.exclusion_data.id_for_label }}">Enter your JSON here</label>
+                </div>
+
+                {% if form.exclusion_data.help_text %}
+                    <div class="form-text">{{ form.exclusion_data.help_text }}</div>
+                {% endif %}
+                {% if form.exclusion_data.errors %}
+                    <div class="invalid-feedback d-block">{{ form.exclusion_data.errors|join:", " }}</div>
+                {% endif %}
+            </div>
+        </div>
+
+        <div class="card shadow-sm">
+            <div class="card-body">
+                <label class="small text-uppercase text-body-secondary fw-semibold mb-3 d-block">
+                    <i class="fa fa-shield-virus text-primary me-1"></i>
+                    {{ form.waf_policies.label }}
+                    <i class="far fa-question-circle text-secondary ms-1"
+                       data-bs-toggle="tooltip"
+                       title="Select one or more WAF policies"></i>
+                </label>
+
+                <div class="dropdown">
+                    <button class="btn btn-outline-secondary dropdown-toggle w-100 text-start"
+                            type="button" id="wafPoliciesDropdown"
+                            data-bs-toggle="dropdown" data-bs-auto-close="outside"
+                            aria-expanded="false">
+                        <i class="fa fa-shield me-2 text-primary"></i>
+                        <span id="wafPoliciesLabel">Select WAF Policies</span>
+                    </button>
+
+                    <ul class="dropdown-menu w-100 p-3" aria-labelledby="wafPoliciesDropdown" style="max-height: 22rem; overflow-y: auto;">
+                        <li class="mb-2">
+                            <div class="input-group">
+                                <span class="input-group-text">
+                                    <i class="fa fa-search text-secondary"></i>
+                                </span>
+                                <input type="text" class="form-control" id="wafPolicySearch" placeholder="Search policies...">
+                            </div>
+                        </li>
+
+                        <li class="d-flex justify-content-between align-items-center mb-2">
+                            <div class="form-check">
+                                <input class="form-check-input" type="checkbox" id="selectAllPolicies">
+                                <label class="form-check-label fw-semibold" for="selectAllPolicies">
+                                    Select all
+                                </label>
+                            </div>
+                            <span class="text-muted small" id="noPoliciesFound" style="display:none;">
+                                No policies found
+                            </span>
+                        </li>
+
+                        <li><hr class="dropdown-divider"></li>
+
+                        {% for policy in form.waf_policies %}
+                            <li class="waf-policy-item">
+                                <div class="form-check py-1">
+                                    {{ policy.tag }}
+                                    <label class="form-check-label" for="{{ policy.id_for_label }}">
+                                        {{ policy.choice_label }}
+                                    </label>
+                                </div>
+                            </li>
+                        {% endfor %}
+                    </ul>
+                </div>
+
+                <div class="form-text mt-2">
+                    Select one or more WAF policies to apply changes to.
+                </div>
+            </div>
+        </div>
+
+    </div>
+
+    <div class="modal-footer bg-body">
+        <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">
+            <i class="fa fa-times me-1"></i> Cancel
+        </button>
+        <button type="submit" class="btn btn-primary" id="waf-submit-btn">
+            <i class="fa fa-check me-1"></i> Apply Changes
+        </button>
+    </div>
+</form>
+
+<script>
+(function () {
+    if (typeof bootstrap !== 'undefined') {
+        document.querySelectorAll('[data-bs-toggle="tooltip"]').forEach(function (el) {
+            if (!bootstrap.Tooltip.getInstance(el)) {
+                new bootstrap.Tooltip(el);
+            }
+        });
+    }
+
+    const wafPoliciesDropdown = document.getElementById('wafPoliciesDropdown');
+    const wafPoliciesLabel    = document.getElementById('wafPoliciesLabel');
+    const wafPoliciesMenu     = document.querySelector('[aria-labelledby="wafPoliciesDropdown"]');
+    const wafPolicySearch     = document.getElementById('wafPolicySearch');
+    const selectAllPolicies   = document.getElementById('selectAllPolicies');
+    const noPoliciesFound     = document.getElementById('noPoliciesFound');
+
+    let isProcessingAll = false;
+
+    if (wafPoliciesDropdown && wafPoliciesMenu) {
+        function updatePolicySelection() {
+            const checkedItems = wafPoliciesMenu.querySelectorAll('.waf-policy-item input[type="checkbox"]:checked');
+            const allItems = wafPoliciesMenu.querySelectorAll('.waf-policy-item input[type="checkbox"]');
+
+            wafPoliciesLabel.textContent = checkedItems.length
+                ? `${checkedItems.length} WAF Polic${checkedItems.length === 1 ? 'y' : 'ies'} selected`
+                : 'Select WAF Policies';
+
+            if (!isProcessingAll && selectAllPolicies) {
+                selectAllPolicies.checked = allItems.length > 0 && checkedItems.length === allItems.length;
+            }
+        }
+
+        wafPolicySearch?.addEventListener('input', function () {
+            const term = this.value.toLowerCase();
+            const items = document.querySelectorAll('.waf-policy-item');
+            let found = 0;
+
+            items.forEach(item => {
+                const label = item.querySelector('label')?.textContent.toLowerCase() || '';
+                const visible = label.includes(term);
+                item.style.display = visible ? '' : 'none';
+                if (visible) found++;
+            });
+
+            noPoliciesFound.style.display = found === 0 ? '' : 'none';
+        });
+
+        selectAllPolicies?.addEventListener('change', function () {
+            isProcessingAll = true;
+            const visibleItems = document.querySelectorAll('.waf-policy-item:not([style*="display: none"]) input[type="checkbox"]');
+            visibleItems.forEach(cb => {
+                cb.checked = this.checked;
+                cb.dispatchEvent(new Event('change'));
+            });
+            updatePolicySelection();
+            isProcessingAll = false;
+        });
+
+        wafPoliciesMenu.addEventListener('change', function (e) {
+            if (e.target.type === 'checkbox' &&
+                e.target.id !== 'selectAllPolicies' &&
+                e.target.closest('.waf-policy-item')) {
+                updatePolicySelection();
+            }
+        });
+
+        wafPoliciesMenu.addEventListener('click', function (e) {
+            e.stopPropagation();
+        });
+
+        wafPoliciesDropdown.addEventListener('hide.bs.dropdown', function () {
+            if (wafPolicySearch) wafPolicySearch.value = '';
+            document.querySelectorAll('.waf-policy-item').forEach(it => it.style.display = '');
+            if (noPoliciesFound) noPoliciesFound.style.display = 'none';
+            updatePolicySelection();
+        });
+
+        updatePolicySelection();
+    }
+
+    if (typeof iziToast !== 'undefined') {
+        iziToast.settings({
+            timeout: 5000,
+            resetOnHover: true,
+            position: 'topRight',
+            transitionIn: 'fadeInDown',
+            transitionOut: 'fadeOutUp',
+            closeOnEscape: true,
+            progressBar: true,
+            layout: 2
+        });
+    }
+
+    function showToast(type, title, message) {
+        if (typeof iziToast === 'undefined') {
+            console[type === 'error' ? 'error' : 'log'](`${title}: ${message}`);
+            return;
+        }
+        const fn = {
+            success: iziToast.success,
+            error: iziToast.error,
+            warning: iziToast.warning,
+            info: iziToast.info
+        }[type] || iziToast.info;
+
+        fn.call(iziToast, { title: title || '', message: message || '' });
+    }
+
+    window.showWafToast = showToast;
+
+    const form = document.getElementById('waf-rules-form');
+    const submitBtn = document.getElementById('waf-submit-btn');
+
+    form?.addEventListener('submit', function (e) {
+        e.preventDefault();
+
+        const selectedPolicies = wafPoliciesMenu
+            ? wafPoliciesMenu.querySelectorAll('.waf-policy-item input[type="checkbox"]:checked')
+            : [];
+
+        if (wafPoliciesMenu && selectedPolicies.length === 0) {
+            showToast('warning', 'No policies selected', 'Please select at least one WAF policy before applying changes.');
+            return;
+        }
+
+        const jsonField = document.getElementById('{{ form.exclusion_data.id_for_label }}');
+        if (jsonField && jsonField.value.trim()) {
+            try {
+                JSON.parse(jsonField.value);
+            } catch {
+                showToast('error', 'Invalid JSON', 'The exclusion or rule data is not valid JSON.');
+                return;
+            }
+        }
+
+        const originalHtml = submitBtn.innerHTML;
+        submitBtn.disabled = true;
+        submitBtn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span> Applying...';
+
+        const formData = new FormData(form);
+
+        fetch(form.action, {
+            method: 'POST',
+            body: formData,
+            headers: {
+                'X-Requested-With': 'XMLHttpRequest',
+                'X-CSRFToken': formData.get('csrfmiddlewaretoken')
+            }
+        })
+        .then(r => r.json().then(data => ({ ok: r.ok, data })))
+        .then(({ ok, data }) => {
+            if (ok && data.success) {
+                showToast(
+                    'success',
+                    data.title || 'Changes applied',
+                    data.message || 'WAF rules updated successfully.'
+                );
+
+                const modalEl = form.closest('.modal');
+                if (modalEl && typeof bootstrap !== 'undefined') {
+                    const modal = bootstrap.Modal.getInstance(modalEl);
+                    if (modal) setTimeout(() => modal.hide(), 800);
+                }
+
+                form.reset();
+
+                if (typeof window.onWafRulesUpdated === 'function') {
+                    window.onWafRulesUpdated(data);
+                }
+            } else {
+                showToast(
+                    'error',
+                    data.title || 'Error',
+                    data.message || 'Something went wrong while applying changes.'
+                );
+            }
+        })
+        .catch(err => {
+            console.error(err);
+            showToast('error', 'Network error', 'The request could not be completed. Please try again.');
+        })
+        .finally(() => {
+            submitBtn.disabled = false;
+            submitBtn.innerHTML = originalHtml;
+        });
+    });
+
+    {% if messages %}
+        {% for message in messages %}
+            showToast(
+                '{{ message.tags|default:"info" }}',
+                '{{ message.tags|title|default:"Notice" }}',
+                '{{ message|escapejs }}'
+            );
+        {% endfor %}
+    {% endif %}
+})();
+</script>
