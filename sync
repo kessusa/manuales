@@ -1,0 +1,179 @@
+"""
+Management command to sync a local directory tree into django-filer,
+recreating the folder hierarchy as filer Folders.
+
+Location in project: rss/management/commands/sync_folder_to_filer.py
+
+Usage examples:
+    # Mirror C:\\reports\\firewall into filer under "Firewall APAC Rules"
+    python manage.py sync_folder_to_filer "C:\\reports\\firewall" --target "Firewall APAC Rules"
+
+    # Replace files that already exist in filer with the local version
+    python manage.py sync_folder_to_filer "C:\\reports\\firewall" --target "Firewall APAC Rules" --replace
+
+    # Delete local files after uploading them
+    python manage.py sync_folder_to_filer "C:\\reports\\firewall" --target "Firewall APAC Rules" --delete-source
+
+    # Only upload files matching a pattern (glob)
+    python manage.py sync_folder_to_filer "C:\\reports" --target "Reports" --pattern "*.csv"
+"""
+from pathlib import Path
+
+from django.core.files import File as DjangoFile
+from django.core.management.base import BaseCommand, CommandError
+
+from filer.models import File as FilerFile, Folder
+
+
+class Command(BaseCommand):
+    help = (
+        'Sync a local directory tree into django-filer, recreating the folder '
+        'hierarchy and uploading every file found.'
+    )
+
+    def add_arguments(self, parser):
+        parser.add_argument(
+            'source_dir',
+            type=str,
+            help='Absolute path to the local source directory to sync.',
+        )
+        parser.add_argument(
+            '--target',
+            type=str,
+            required=True,
+            help=(
+                'Target folder path inside filer where the source tree will be '
+                'mirrored. Use "/" for nested folders, e.g. "Reports/2026". '
+                'Missing folders are created automatically.'
+            ),
+        )
+        parser.add_argument(
+            '--pattern',
+            type=str,
+            default='*',
+            help='Glob pattern for files to include (default: "*").',
+        )
+        parser.add_argument(
+            '--replace',
+            action='store_true',
+            help='Replace files that already exist in the target filer folder.',
+        )
+        parser.add_argument(
+            '--delete-source',
+            action='store_true',
+            help='Delete each local file after a successful upload.',
+        )
+        parser.add_argument(
+            '--dry-run',
+            action='store_true',
+            help='Show what would happen without uploading anything.',
+        )
+
+    def handle(self, *args, **options):
+        source_dir = Path(options['source_dir'])
+        target_path = options['target']
+        pattern = options['pattern']
+        replace = options['replace']
+        delete_source = options['delete_source']
+        dry_run = options['dry_run']
+
+        if not source_dir.is_dir():
+            raise CommandError(f'Source directory does not exist: {source_dir}')
+
+        # Resolve (or create) the root target folder in filer
+        if dry_run:
+            self.stdout.write(self.style.WARNING('--- DRY RUN: no changes will be persisted ---'))
+            target_root = None
+        else:
+            target_root = self._get_or_create_folder(target_path)
+
+        uploaded = 0
+        skipped = 0
+        replaced = 0
+
+        # Walk the local tree
+        for local_file in sorted(source_dir.rglob(pattern)):
+            if not local_file.is_file():
+                continue
+
+            # Compute the relative folder path for this file inside the source tree
+            relative = local_file.relative_to(source_dir).parent
+            relative_parts = [p for p in relative.parts if p]
+
+            # Resolve the matching filer folder (target_root + relative subfolders)
+            if dry_run:
+                folder_repr = '/'.join([target_path] + relative_parts)
+                self.stdout.write(f'[dry-run] Would upload {local_file} -> {folder_repr}')
+                uploaded += 1
+                continue
+
+            target_folder = target_root
+            for part in relative_parts:
+                target_folder, _ = Folder.objects.get_or_create(name=part, parent=target_folder)
+
+            # Check whether a file with the same name already exists there
+            existing = FilerFile.objects.filter(
+                folder=target_folder,
+                original_filename=local_file.name,
+            ).first()
+
+            if existing:
+                if replace:
+                    existing.delete()
+                    replaced += 1
+                else:
+                    self.stdout.write(self.style.WARNING(
+                        f'Skipped (already exists): {local_file.name} in '
+                        f'{self._folder_display(target_folder)}'
+                    ))
+                    skipped += 1
+                    continue
+
+            # Perform the upload
+            with local_file.open('rb') as fh:
+                FilerFile.objects.create(
+                    file=DjangoFile(fh, name=local_file.name),
+                    folder=target_folder,
+                    original_filename=local_file.name,
+                )
+
+            uploaded += 1
+            self.stdout.write(
+                f'Uploaded: {local_file.name} -> {self._folder_display(target_folder)}'
+            )
+
+            # Optionally delete the local file
+            if delete_source:
+                try:
+                    local_file.unlink()
+                except OSError as exc:
+                    self.stdout.write(self.style.WARNING(
+                        f'Could not delete source file {local_file}: {exc}'
+                    ))
+
+        # Summary
+        self.stdout.write(self.style.SUCCESS(
+            f'Done. Uploaded: {uploaded}, replaced: {replaced}, skipped: {skipped}.'
+        ))
+
+    @staticmethod
+    def _get_or_create_folder(folder_path):
+        """Resolve a "/"-separated folder path inside filer, creating missing levels."""
+        parts = [p.strip() for p in folder_path.split('/') if p.strip()]
+        if not parts:
+            raise CommandError('Target folder path cannot be empty.')
+
+        parent = None
+        for part in parts:
+            parent, _ = Folder.objects.get_or_create(name=part, parent=parent)
+        return parent
+
+    @staticmethod
+    def _folder_display(folder):
+        """Build a human-readable path for a filer Folder, e.g. 'Reports/2026/April'."""
+        parts = []
+        node = folder
+        while node is not None:
+            parts.insert(0, node.name)
+            node = node.parent
+        return '/'.join(parts)
