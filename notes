@@ -1,0 +1,65 @@
+# =============================================================================
+# Integration notes for the file manager
+# =============================================================================
+#
+# This file is just a reference. Copy the relevant snippets into your real
+# settings.py and project-level urls.py.
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# 1. settings.py
+# -----------------------------------------------------------------------------
+# Add the following apps to INSTALLED_APPS (if they are not already there):
+
+INSTALLED_APPS = [
+    # ... your existing apps ...
+    'easy_thumbnails',
+    'filer',
+    'mptt',
+    'rss',  # your app that contains the file manager views
+]
+
+# Thumbnail processors required by django-filer:
+THUMBNAIL_HIGH_RESOLUTION = True
+THUMBNAIL_PROCESSORS = (
+    'easy_thumbnails.processors.colorspace',
+    'easy_thumbnails.processors.autocrop',
+    'filer.thumbnail_processors.scale_and_crop_with_subject_location',
+    'easy_thumbnails.processors.filters',
+)
+
+# Where uploaded files are physically stored on disk:
+# (BASE_DIR is already defined at the top of your settings.py)
+MEDIA_ROOT = BASE_DIR / 'media'
+MEDIA_URL = '/media/'
+
+
+# -----------------------------------------------------------------------------
+# 2. Project-level urls.py (NOT the rss/urls.py)
+# -----------------------------------------------------------------------------
+# Make sure your project's main urls.py includes the rss app, e.g.:
+
+from django.contrib import admin
+from django.urls import include, path
+from django.conf import settings
+from django.conf.urls.static import static
+
+urlpatterns = [
+    path('admin/', admin.site.urls),
+    path('rss/', include('rss.urls', namespace='rss')),
+    # ... your other routes ...
+]
+
+# Serve uploaded files in development only:
+if settings.DEBUG:
+    urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
+
+
+# -----------------------------------------------------------------------------
+# 3. Run migrations
+# -----------------------------------------------------------------------------
+# After updating settings, run:
+#
+#   python manage.py migrate
+#   python manage.py collectstatic   (only needed in production)
