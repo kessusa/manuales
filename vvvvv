@@ -1,0 +1,21 @@
+"""
+Add these path() entries to your existing rss/urls.py.
+"""
+from django.urls import path
+from . import views
+
+new_zip_routes = [
+    # Download an entire folder as a ZIP archive (preserves structure)
+    path(
+        'file_manager/download_folder/<int:folder_id>/',
+        views.download_folder_zip,
+        name='download_folder_zip',
+    ),
+
+    # Download multiple selected files as a single ZIP (POST with file_ids)
+    path(
+        'file_manager/download_selection/',
+        views.download_files_zip,
+        name='download_files_zip',
+    ),
+]
