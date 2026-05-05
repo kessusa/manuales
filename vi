@@ -1,0 +1,478 @@
+"""
+File manager views.
+
+Location in project: rss/views.py
+(Or append the views in this file to your existing rss/views.py.)
+
+Features included:
+    - Browse folders and files
+    - Upload, download, delete files
+    - Create, rename, delete folders
+    - Move files and folders
+    - Manage per-folder permissions (user / group / everybody)
+    - Permission enforcement on browsing and actions
+"""
+from django.contrib import messages
+from django.contrib.auth.decorators import login_required
+from django.contrib.auth.models import Group
+from django.core.exceptions import PermissionDenied
+from django.db.models import Q
+from django.http import FileResponse
+from django.shortcuts import get_object_or_404, redirect, render
+from django.views.decorators.http import require_POST
+
+from filer.models import File, Folder, FolderPermission
+
+from accounts.models import User
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _build_breadcrumbs(folder):
+    """Return the chain of ancestor folders from root down to the given folder."""
+    breadcrumbs = []
+    node = folder
+    while node is not None:
+        breadcrumbs.insert(0, node)
+        node = node.parent
+    return breadcrumbs
+
+
+def _folder_path(folder):
+    """Return a human-readable path like 'Reports / 2026 / April'."""
+    parts = []
+    node = folder
+    while node is not None:
+        parts.insert(0, node.name)
+        node = node.parent
+    return ' / '.join(parts)
+
+
+def _all_folders_for_picker():
+    """Return all folders as dicts, used to populate move-to dropdowns."""
+    return [
+        {'id': f.id, 'path': _folder_path(f)}
+        for f in Folder.objects.all().order_by('name')
+    ]
+
+
+def _redirect_to_folder(folder_id):
+    """Redirect back to the file manager view of a given folder (or root)."""
+    if folder_id:
+        return redirect('file_manager_folder', folder_id=folder_id)
+    return redirect('file_manager')
+
+
+def _redirect_to_folder_for_file(file_id):
+    """Redirect to the folder that contains the given file."""
+    file_obj = File.objects.filter(id=file_id).first()
+    folder_id = file_obj.folder_id if file_obj else None
+    return _redirect_to_folder(folder_id)
+
+
+# ---------------------------------------------------------------------------
+# Permission helpers
+# ---------------------------------------------------------------------------
+
+def _ancestors_including(folder):
+    """Yield the folder and all its ancestors, from leaf to root."""
+    node = folder
+    while node is not None:
+        yield node
+        node = node.parent
+
+
+def _has_permission(user, folder, action):
+    """
+    Check whether `user` has a given `action` permission on `folder`.
+
+    `action` is one of: 'can_read', 'can_edit', 'can_add_children'.
+
+    Walks up the folder tree, taking into account the scope of each
+    FolderPermission entry (THIS / CHILDREN / ALL). Superusers always pass.
+    """
+    if user.is_superuser:
+        return True
+
+    # If folder is None we are at the root: only superusers pass by default,
+    # but anyone authenticated can see the root listing. We allow read here
+    # so users can navigate into folders they do have access to.
+    if folder is None:
+        return action == 'can_read'
+
+    user_groups = user.groups.all()
+
+    # Walk from the current folder up to the root, looking for any matching
+    # permission that grants or denies the action.
+    for distance, node in enumerate(_ancestors_including(folder)):
+        # distance == 0 means the folder itself; > 0 means an ancestor
+        relevant_scopes = [FolderPermission.ALL]
+        if distance == 0:
+            relevant_scopes.append(FolderPermission.THIS)
+        else:
+            relevant_scopes.append(FolderPermission.CHILDREN)
+
+        perms = FolderPermission.objects.filter(folder=node, type__in=relevant_scopes).filter(
+            Q(user=user) | Q(group__in=user_groups) | Q(everybody=True)
+        )
+
+        # Explicit DENY wins over ALLOW at the same level
+        if perms.filter(**{action: FolderPermission.DENY}).exists():
+            return False
+        if perms.filter(**{action: FolderPermission.ALLOW}).exists():
+            return True
+
+    # No matching permission found: deny by default
+    return False
+
+
+def _filter_visible_folders(user, queryset):
+    """Return only folders from the queryset that the user can read."""
+    if user.is_superuser:
+        return queryset
+    return [f for f in queryset if _has_permission(user, f, 'can_read')]
+
+
+def _filter_visible_files(user, queryset):
+    """Return only files whose folder the user can read."""
+    if user.is_superuser:
+        return queryset
+    return [
+        f for f in queryset
+        if f.folder is None or _has_permission(user, f.folder, 'can_read')
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Browse
+# ---------------------------------------------------------------------------
+
+@login_required
+def file_manager(request, folder_id=None):
+    """
+    Render the file manager view.
+
+    If folder_id is provided, list its subfolders and files.
+    Otherwise, list root-level folders and files (those without a parent).
+    """
+    if folder_id:
+        current_folder = get_object_or_404(Folder, id=folder_id)
+        if not _has_permission(request.user, current_folder, 'can_read'):
+            raise PermissionDenied('You do not have permission to view this folder.')
+        subfolders = current_folder.children.all().order_by('name')
+        files = current_folder.files.all().order_by('original_filename')
+    else:
+        current_folder = None
+        subfolders = Folder.objects.filter(parent__isnull=True).order_by('name')
+        files = File.objects.filter(folder__isnull=True).order_by('original_filename')
+
+    # Apply read-permission filtering on listed items
+    visible_subfolders = _filter_visible_folders(request.user, subfolders)
+    visible_files = _filter_visible_files(request.user, files)
+
+    context = {
+        'current_folder': current_folder,
+        'subfolders': visible_subfolders,
+        'files': visible_files,
+        'breadcrumbs': _build_breadcrumbs(current_folder),
+        'all_folders': _all_folders_for_picker(),
+        'can_edit_current': (
+            current_folder is None
+            or _has_permission(request.user, current_folder, 'can_edit')
+        ),
+        'can_add_in_current': (
+            current_folder is None
+            or _has_permission(request.user, current_folder, 'can_add_children')
+        ),
+    }
+    return render(request, 'tools/file_manager.html', context)
+
+
+# ---------------------------------------------------------------------------
+# Files: download / upload / delete
+# ---------------------------------------------------------------------------
+
+@login_required
+def download_file(request, file_id):
+    """Stream a file as an attachment so the browser triggers a download."""
+    file_obj = get_object_or_404(File, id=file_id)
+    if file_obj.folder and not _has_permission(request.user, file_obj.folder, 'can_read'):
+        raise PermissionDenied
+    return FileResponse(
+        file_obj.file.open('rb'),
+        as_attachment=True,
+        filename=file_obj.original_filename,
+    )
+
+
+@login_required
+@require_POST
+def upload_file(request):
+    """Handle one or multiple file uploads."""
+    folder_id = request.POST.get('folder_id') or None
+    target_folder = Folder.objects.get(id=folder_id) if folder_id else None
+
+    if target_folder and not _has_permission(request.user, target_folder, 'can_add_children'):
+        raise PermissionDenied('You cannot add files to this folder.')
+
+    uploaded = request.FILES.getlist('files')
+    if not uploaded:
+        messages.warning(request, 'No files were selected.')
+        return _redirect_to_folder(folder_id)
+
+    for uploaded_file in uploaded:
+        File.objects.create(
+            file=uploaded_file,
+            folder=target_folder,
+            original_filename=uploaded_file.name,
+            owner=request.user,
+        )
+
+    messages.success(request, f'{len(uploaded)} file(s) uploaded successfully.')
+    return _redirect_to_folder(folder_id)
+
+
+@login_required
+@require_POST
+def delete_file(request, file_id):
+    """Delete a single file."""
+    file_obj = get_object_or_404(File, id=file_id)
+    if file_obj.folder and not _has_permission(request.user, file_obj.folder, 'can_edit'):
+        raise PermissionDenied
+    parent_folder_id = file_obj.folder_id
+    file_obj.delete()
+    messages.success(request, 'File deleted.')
+    return _redirect_to_folder(parent_folder_id)
+
+
+# ---------------------------------------------------------------------------
+# Folders: create / delete
+# ---------------------------------------------------------------------------
+
+@login_required
+@require_POST
+def create_folder(request):
+    """Create a new folder, optionally nested under a parent folder."""
+    name = request.POST.get('name', '').strip()
+    parent_id = request.POST.get('parent_id') or None
+
+    if not name:
+        messages.error(request, 'Folder name is required.')
+        return _redirect_to_folder(parent_id)
+
+    parent = Folder.objects.get(id=parent_id) if parent_id else None
+    if parent and not _has_permission(request.user, parent, 'can_add_children'):
+        raise PermissionDenied('You cannot add folders here.')
+
+    Folder.objects.create(name=name, parent=parent, owner=request.user)
+    messages.success(request, f'Folder "{name}" created.')
+    return _redirect_to_folder(parent_id)
+
+
+@login_required
+@require_POST
+def delete_folder(request, folder_id):
+    """Delete a folder and its contents (cascade handled by filer)."""
+    folder = get_object_or_404(Folder, id=folder_id)
+    if not _has_permission(request.user, folder, 'can_edit'):
+        raise PermissionDenied
+    parent_folder_id = folder.parent_id
+    folder.delete()
+    messages.success(request, 'Folder deleted.')
+    return _redirect_to_folder(parent_folder_id)
+
+
+# ---------------------------------------------------------------------------
+# Rename
+# ---------------------------------------------------------------------------
+
+@login_required
+@require_POST
+def rename_file(request, file_id):
+    """Rename the display name of a file (and its download filename)."""
+    new_name = request.POST.get('new_name', '').strip()
+    if not new_name:
+        messages.error(request, 'New name is required.')
+        return _redirect_to_folder_for_file(file_id)
+
+    file_obj = get_object_or_404(File, id=file_id)
+    if file_obj.folder and not _has_permission(request.user, file_obj.folder, 'can_edit'):
+        raise PermissionDenied
+
+    file_obj.name = new_name
+    file_obj.original_filename = new_name
+    file_obj.save()
+
+    messages.success(request, f'File renamed to "{new_name}".')
+    return _redirect_to_folder(file_obj.folder_id)
+
+
+@login_required
+@require_POST
+def rename_folder(request, folder_id):
+    """Rename a folder."""
+    new_name = request.POST.get('new_name', '').strip()
+    if not new_name:
+        messages.error(request, 'New name is required.')
+        return redirect('file_manager_folder', folder_id=folder_id)
+
+    folder = get_object_or_404(Folder, id=folder_id)
+    if not _has_permission(request.user, folder, 'can_edit'):
+        raise PermissionDenied
+
+    folder.name = new_name
+    folder.save()
+
+    messages.success(request, f'Folder renamed to "{new_name}".')
+    return redirect('file_manager_folder', folder_id=folder.id)
+
+
+# ---------------------------------------------------------------------------
+# Move
+# ---------------------------------------------------------------------------
+
+@login_required
+@require_POST
+def move_file(request, file_id):
+    """Move a file to a different folder."""
+    target_folder_id = request.POST.get('target_folder_id') or None
+    target_folder = Folder.objects.get(id=target_folder_id) if target_folder_id else None
+
+    file_obj = get_object_or_404(File, id=file_id)
+    if file_obj.folder and not _has_permission(request.user, file_obj.folder, 'can_edit'):
+        raise PermissionDenied
+    if target_folder and not _has_permission(request.user, target_folder, 'can_add_children'):
+        raise PermissionDenied('You cannot place files in the target folder.')
+
+    original_folder_id = file_obj.folder_id
+    file_obj.folder = target_folder
+    file_obj.save()
+
+    target_label = target_folder.name if target_folder else 'root'
+    messages.success(request, f'File moved to "{target_label}".')
+    return _redirect_to_folder(original_folder_id)
+
+
+@login_required
+@require_POST
+def move_folder(request, folder_id):
+    """Move a folder (and its contents) under a different parent folder."""
+    target_parent_id = request.POST.get('target_folder_id') or None
+    folder = get_object_or_404(Folder, id=folder_id)
+
+    if not _has_permission(request.user, folder, 'can_edit'):
+        raise PermissionDenied
+
+    if target_parent_id:
+        target_parent = get_object_or_404(Folder, id=target_parent_id)
+        # Prevent moving a folder into itself or one of its descendants
+        if target_parent == folder or target_parent.is_descendant_of(folder):
+            messages.error(request, 'Cannot move a folder into itself or its children.')
+            return redirect('file_manager_folder', folder_id=folder.id)
+        if not _has_permission(request.user, target_parent, 'can_add_children'):
+            raise PermissionDenied('You cannot place folders in the target.')
+        folder.parent = target_parent
+    else:
+        folder.parent = None
+
+    folder.save()
+
+    target_label = folder.parent.name if folder.parent else 'root'
+    messages.success(request, f'Folder "{folder.name}" moved to "{target_label}".')
+    return redirect('file_manager_folder', folder_id=folder.id)
+
+
+# ---------------------------------------------------------------------------
+# Permissions management UI
+# ---------------------------------------------------------------------------
+
+@login_required
+def folder_permissions(request, folder_id):
+    """List and manage permissions for a folder."""
+    folder = get_object_or_404(Folder, id=folder_id)
+    if not _has_permission(request.user, folder, 'can_edit') and not request.user.is_superuser:
+        raise PermissionDenied
+
+    perms = (
+        FolderPermission.objects
+        .filter(folder=folder)
+        .select_related('user', 'group')
+    )
+    return render(request, 'tools/folder_permissions.html', {
+        'folder': folder,
+        'permissions': perms,
+        'breadcrumbs': _build_breadcrumbs(folder),
+        'all_users': User.objects.all().order_by('user_uid'),
+        'all_groups': Group.objects.all().order_by('name'),
+    })
+
+
+@login_required
+@require_POST
+def add_folder_permission(request, folder_id):
+    """Grant a permission on a folder to a user, group or everybody."""
+    folder = get_object_or_404(Folder, id=folder_id)
+    if not _has_permission(request.user, folder, 'can_edit') and not request.user.is_superuser:
+        raise PermissionDenied
+
+    target_type = request.POST.get('target_type')
+    can_read = request.POST.get('can_read') == 'allow'
+    can_edit = request.POST.get('can_edit') == 'allow'
+    can_add_children = request.POST.get('can_add_children') == 'allow'
+    scope = request.POST.get('scope', 'this')
+
+    scope_map = {
+        'this': FolderPermission.THIS,
+        'children': FolderPermission.CHILDREN,
+        'all': FolderPermission.ALL,
+    }
+
+    perm = FolderPermission(
+        folder=folder,
+        type=scope_map.get(scope, FolderPermission.THIS),
+        can_read=FolderPermission.ALLOW if can_read else FolderPermission.DENY,
+        can_edit=FolderPermission.ALLOW if can_edit else FolderPermission.DENY,
+        can_add_children=(
+            FolderPermission.ALLOW if can_add_children else FolderPermission.DENY
+        ),
+    )
+
+    if target_type == 'user':
+        user_id = request.POST.get('user_id')
+        if not user_id:
+            messages.error(request, 'You must select a user.')
+            return redirect('folder_permissions', folder_id=folder.id)
+        perm.user = get_object_or_404(User, id=user_id)
+    elif target_type == 'group':
+        group_id = request.POST.get('group_id')
+        if not group_id:
+            messages.error(request, 'You must select a group.')
+            return redirect('folder_permissions', folder_id=folder.id)
+        perm.group = get_object_or_404(Group, id=group_id)
+    elif target_type == 'everybody':
+        perm.everybody = True
+    else:
+        messages.error(request, 'Invalid target type.')
+        return redirect('folder_permissions', folder_id=folder.id)
+
+    perm.save()
+    messages.success(request, 'Permission added.')
+    return redirect('folder_permissions', folder_id=folder.id)
+
+
+@login_required
+@require_POST
+def delete_folder_permission(request, perm_id):
+    """Remove a folder permission."""
+    perm = get_object_or_404(FolderPermission, id=perm_id)
+    folder_id = perm.folder_id
+    if (
+        not _has_permission(request.user, perm.folder, 'can_edit')
+        and not request.user.is_superuser
+    ):
+        raise PermissionDenied
+    perm.delete()
+    messages.success(request, 'Permission removed.')
+    return redirect('folder_permissions', folder_id=folder_id)
