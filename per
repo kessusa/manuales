@@ -1,0 +1,209 @@
+{# 
+  Folder permissions management page.
+  Location in project: templates/tools/folder_permissions.html
+#}
+{% extends "base.html" %}
+
+{% block content %}
+<div class="container-fluid py-3">
+
+  {# Breadcrumbs #}
+  <nav aria-label="breadcrumb" class="mb-3">
+    <ol class="breadcrumb">
+      <li class="breadcrumb-item">
+        <a href="{% url 'file_manager' %}" class="text-success">
+          <i class="bi bi-house-door-fill"></i> Home
+        </a>
+      </li>
+      {% for crumb in breadcrumbs %}
+        <li class="breadcrumb-item">
+          <a href="{% url 'file_manager_folder' folder_id=crumb.id %}" class="text-success">{{ crumb.name }}</a>
+        </li>
+      {% endfor %}
+      <li class="breadcrumb-item active">Permissions</li>
+    </ol>
+  </nav>
+
+  {% if messages %}
+    {% for message in messages %}
+      <div class="alert alert-{{ message.tags|default:'info' }} alert-dismissible fade show">
+        {{ message }}
+        <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+      </div>
+    {% endfor %}
+  {% endif %}
+
+  <div class="card shadow-sm mb-4">
+    <div class="card-header bg-white d-flex justify-content-between align-items-center">
+      <h5 class="mb-0">
+        <i class="bi bi-shield-lock"></i> Permissions for "{{ folder.name }}"
+      </h5>
+      <button class="btn btn-sm btn-success" data-bs-toggle="modal" data-bs-target="#addPermModal">
+        <i class="bi bi-plus-lg"></i> Add permission
+      </button>
+    </div>
+    <div class="table-responsive">
+      <table class="table mb-0 align-middle">
+        <thead class="table-light">
+          <tr>
+            <th>Target</th>
+            <th>Scope</th>
+            <th>Read</th>
+            <th>Edit</th>
+            <th>Add children</th>
+            <th class="text-end" style="width: 80px;"></th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for p in permissions %}
+            <tr>
+              <td>
+                {% if p.everybody %}
+                  <i class="bi bi-people-fill text-info"></i> Everybody
+                {% elif p.user %}
+                  <i class="bi bi-person"></i> {{ p.user }}
+                {% elif p.group %}
+                  <i class="bi bi-people"></i> Group: {{ p.group.name }}
+                {% endif %}
+              </td>
+              <td>{{ p.get_type_display }}</td>
+              <td>
+                {% if p.can_read == 1 %}<span class="badge bg-success">Allow</span>
+                {% elif p.can_read == 0 %}<span class="badge bg-danger">Deny</span>
+                {% else %}<span class="text-muted">-</span>{% endif %}
+              </td>
+              <td>
+                {% if p.can_edit == 1 %}<span class="badge bg-success">Allow</span>
+                {% elif p.can_edit == 0 %}<span class="badge bg-danger">Deny</span>
+                {% else %}<span class="text-muted">-</span>{% endif %}
+              </td>
+              <td>
+                {% if p.can_add_children == 1 %}<span class="badge bg-success">Allow</span>
+                {% elif p.can_add_children == 0 %}<span class="badge bg-danger">Deny</span>
+                {% else %}<span class="text-muted">-</span>{% endif %}
+              </td>
+              <td class="text-end">
+                <form method="post"
+                      action="{% url 'delete_folder_permission' perm_id=p.id %}"
+                      class="d-inline"
+                      onsubmit="return confirm('Remove this permission?');">
+                  {% csrf_token %}
+                  <button class="btn btn-sm btn-outline-danger" title="Remove">
+                    <i class="bi bi-trash"></i>
+                  </button>
+                </form>
+              </td>
+            </tr>
+          {% empty %}
+            <tr>
+              <td colspan="6" class="text-muted text-center py-4">
+                No permissions defined. Add one to restrict access to this folder.
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <a href="{% url 'file_manager_folder' folder_id=folder.id %}" class="btn btn-outline-secondary">
+    <i class="bi bi-arrow-left"></i> Back to folder
+  </a>
+</div>
+
+{# Add permission modal #}
+<div class="modal fade" id="addPermModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog modal-lg">
+    <form method="post" action="{% url 'add_folder_permission' folder_id=folder.id %}" class="modal-content">
+      {% csrf_token %}
+      <div class="modal-header">
+        <h5 class="modal-title">Add permission</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+
+        <div class="mb-3">
+          <label class="form-label">Target type</label>
+          <select name="target_type" id="permTargetType" class="form-select" required>
+            <option value="user">Specific user</option>
+            <option value="group">Group</option>
+            <option value="everybody">Everybody</option>
+          </select>
+        </div>
+
+        <div class="mb-3" id="permUserField">
+          <label class="form-label">User</label>
+          <select name="user_id" class="form-select">
+            <option value="">-- Select a user --</option>
+            {% for u in all_users %}
+              <option value="{{ u.id }}">{{ u.user_uid }} ({{ u.email }})</option>
+            {% endfor %}
+          </select>
+        </div>
+
+        <div class="mb-3" id="permGroupField" style="display: none;">
+          <label class="form-label">Group</label>
+          <select name="group_id" class="form-select">
+            <option value="">-- Select a group --</option>
+            {% for g in all_groups %}
+              <option value="{{ g.id }}">{{ g.name }}</option>
+            {% endfor %}
+          </select>
+        </div>
+
+        <div class="mb-3">
+          <label class="form-label">Scope</label>
+          <select name="scope" class="form-select">
+            <option value="this">This folder only</option>
+            <option value="children">Children only (not this folder)</option>
+            <option value="all">This folder and all its children (recursive)</option>
+          </select>
+        </div>
+
+        <hr>
+        <p class="mb-2"><strong>Permissions to grant:</strong></p>
+        <div class="row">
+          <div class="col">
+            <div class="form-check">
+              <input class="form-check-input" type="checkbox" name="can_read" value="allow" id="permRead" checked>
+              <label class="form-check-label" for="permRead">Can read</label>
+            </div>
+          </div>
+          <div class="col">
+            <div class="form-check">
+              <input class="form-check-input" type="checkbox" name="can_edit" value="allow" id="permEdit">
+              <label class="form-check-label" for="permEdit">Can edit</label>
+            </div>
+          </div>
+          <div class="col">
+            <div class="form-check">
+              <input class="form-check-input" type="checkbox" name="can_add_children" value="allow" id="permAdd">
+              <label class="form-check-label" for="permAdd">Can add children</label>
+            </div>
+          </div>
+        </div>
+        <small class="text-muted d-block mt-2">
+          Unchecked options are stored as explicit DENY.
+        </small>
+
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+        <button type="submit" class="btn btn-success">
+          <i class="bi bi-check-lg"></i> Save
+        </button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<script>
+  // Toggle the user/group field depending on the chosen target type
+  document.getElementById('permTargetType').addEventListener('change', function () {
+    const userField = document.getElementById('permUserField');
+    const groupField = document.getElementById('permGroupField');
+    userField.style.display = (this.value === 'user') ? '' : 'none';
+    groupField.style.display = (this.value === 'group') ? '' : 'none';
+  });
+</script>
+{% endblock %}
