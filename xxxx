@@ -1,0 +1,83 @@
+"""
+Replace your existing delete_folder view in rss/views.py with this version.
+
+Problem fixed:
+    When a folder contains files (or other subfolders with files), calling
+    folder.delete() triggers Django's cascade-delete machinery which loads all
+    related File objects through filer's polymorphic queryset. With certain
+    combinations of filer + django-polymorphic + MPTT, the polymorphic iterator
+    re-enters recursively and blows up the stack. The Django dev server then
+    crashes.
+
+Approach:
+    Walk the tree depth-first (leaves first). For each folder, delete its files
+    one by one using filter(pk=...).delete() - that processes one row per call
+    so the polymorphic iterator never has more than a single row to iterate.
+    Once the folder is empty, folder.delete() is trivial.
+"""
+from django.contrib.auth.decorators import login_required
+from django.http import JsonResponse
+from django.shortcuts import get_object_or_404
+from django.views.decorators.http import require_POST
+
+from filer.models import File, Folder
+
+# Reuses _has_permission already defined in views.py
+
+
+@login_required
+@require_POST
+def delete_folder(request, folder_id):
+    """
+    Delete a folder and recursively all its files and subfolders.
+    Returns JSON for the AJAX caller in the file manager UI.
+    """
+    folder = get_object_or_404(Folder, id=folder_id)
+
+    if not _has_permission(request.user, folder, 'can_edit'):
+        return JsonResponse({
+            'status': False,
+            'message': 'You do not have permission to delete this folder.',
+        })
+
+    folder_name = folder.name
+
+    try:
+        _delete_folder_tree(folder)
+    except Exception as exc:
+        # Log the full traceback for debugging while keeping the user message clean
+        import traceback
+        traceback.print_exc()
+        return JsonResponse({
+            'status': False,
+            'message': f'Could not delete folder: {exc}',
+        })
+
+    return JsonResponse({
+        'status': True,
+        'message': f'Folder "{folder_name}" and all its contents deleted.',
+    })
+
+
+def _delete_folder_tree(folder):
+    """
+    Depth-first deletion of a folder.
+
+    Processes the deepest subfolders first so that by the time we touch any
+    Folder.delete(), the folder is already empty. We delete files one at a
+    time via filter(pk=...).delete() to avoid loading filer's polymorphic
+    queryset in bulk (which is what causes the crash).
+    """
+    # Recurse into children first (deepest leaves get processed before parents)
+    for child in list(folder.children.all()):
+        _delete_folder_tree(child)
+
+    # Delete each file individually. values_list returns plain integers, no
+    # File instances are constructed here, so the polymorphic iterator never
+    # runs over the whole set at once.
+    file_ids = list(folder.files.values_list('id', flat=True))
+    for fid in file_ids:
+        File.objects.filter(pk=fid).delete()
+
+    # Folder is empty now, plain delete is safe
+    folder.delete()
