@@ -1,0 +1,44 @@
+const items = $input.all();
+const output = [];
+
+for (const item of items) {
+  let raw =
+    item.json.output ||
+    item.json.text ||
+    item.json.response ||
+    item.json.message ||
+    item.json.content ||
+    "";
+
+  // Si el agente mete texto antes/después del JSON, intentamos quedarnos solo con el JSON
+  if (typeof raw === "string") {
+    raw = raw.trim();
+
+    const firstArray = raw.indexOf("[");
+    const lastArray = raw.lastIndexOf("]");
+
+    if (firstArray !== -1 && lastArray !== -1) {
+      raw = raw.slice(firstArray, lastArray + 1);
+    }
+  }
+
+  let parsed;
+
+  try {
+    parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
+  } catch (error) {
+    throw new Error("La IA no devolvió JSON válido. Respuesta recibida: " + raw);
+  }
+
+  const rows = Array.isArray(parsed)
+    ? parsed
+    : parsed.results || parsed.rows || [];
+
+  for (const row of rows) {
+    output.push({
+      json: row
+    });
+  }
+}
+
+return output;
