@@ -1,38 +1,44 @@
+
 const items = $input.all();
 const output = [];
 
 for (const item of items) {
   let raw =
-    item.json.output ||
-    item.json.text ||
-    item.json.response ||
-    item.json.message ||
-    item.json.content ||
+    item.json?.response?.generations?.[0]?.[0]?.text ||
+    item.json?.output ||
+    item.json?.text ||
+    item.json?.response ||
     "";
 
-  // Si el agente mete texto antes/después del JSON, intentamos quedarnos solo con el JSON
-  if (typeof raw === "string") {
-    raw = raw.trim();
-
-    const firstArray = raw.indexOf("[");
-    const lastArray = raw.lastIndexOf("]");
-
-    if (firstArray !== -1 && lastArray !== -1) {
-      raw = raw.slice(firstArray, lastArray + 1);
-    }
+  if (typeof raw !== "string") {
+    raw = JSON.stringify(raw);
   }
+
+  raw = raw.trim();
+
+  // Quitar texto antes/después del JSON
+  const firstBrace = raw.indexOf("{");
+  const lastBrace = raw.lastIndexOf("}");
+
+  if (firstBrace === -1 || lastBrace === -1) {
+    throw new Error("No se encontró JSON en la respuesta IA: " + raw);
+  }
+
+  raw = raw.slice(firstBrace, lastBrace + 1);
 
   let parsed;
 
   try {
-    parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
+    parsed = JSON.parse(raw);
   } catch (error) {
-    throw new Error("La IA no devolvió JSON válido. Respuesta recibida: " + raw);
+    throw new Error("JSON inválido recibido de la IA: " + raw);
   }
 
-  const rows = Array.isArray(parsed)
-    ? parsed
-    : parsed.results || parsed.rows || [];
+  const rows =
+    parsed.per_entry_analysis ||
+    parsed.results ||
+    parsed.rows ||
+    [];
 
   for (const row of rows) {
     output.push({
