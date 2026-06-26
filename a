@@ -1,0 +1,80 @@
+from django.core.management.base import BaseCommand
+
+from API_cnx.f5_asm import F5ASMApi
+from API_cnx.inetportal import InetPortalV2
+from rss.models import F5Asm, PoolServer, TaskUpdateDate
+
+
+# # f5_asm
+class Command(BaseCommand):
+    help = 'Update F5 ASM data'
+
+    def handle(self, *args, **options):
+        instance_list = [
+            ('emea', 'uk_icp'), ('emea', 'uk_ets'),
+            ('emea', 'fr_prod'), ('emea', 'fr_uat'), ('apac', None)
+        ]
+
+        # Token de inetportal (una sola vez) para enriquecer los VS
+        inet_obj = InetPortalV2()
+        inet_token = inet_obj.get_token()
+
+        for region, instance in instance_list:
+            obj_f5_asm = F5ASMApi(instance=instance, region=region)
+            result = obj_f5_asm.get_data()
+
+            if not result:
+                continue
+
+            self.stdout.write(self.style.SUCCESS(f'Start updating {instance}'))
+            seen = set()
+
+            for item in result:
+                # Cada politica trae uno o varios virtual servers -> una fila por VS
+                for vs in (item.get('virtual_servers') or []):
+                    vs_name = vs.split('/')[-1]   # '/Common/centric-...' -> 'centric-...'
+
+                    enrich = inet_obj.get_data_to_enrich_f5_details(inet_token, vs_name)
+                    if not enrich:
+                        continue
+
+                    seen.add(vs_name)
+
+                    # PoolServer -> lista de IPs de los miembros
+                    pool_ips = enrich.pop('pool_servers', [])
+                    if pool_ips:
+                        pool_server_instance = PoolServer.objects.create(
+                            name=vs_name,
+                            ip_address=pool_ips
+                        )
+                    else:
+                        pool_server_instance = None
+
+                    F5Asm.objects.update_or_create(
+                        vs_name=vs_name,
+                        region=region,
+                        instance=instance,
+                        defaults={
+                            'asm_policy': item.get('asm_policy'),
+                            'virtual_servers': item.get('virtual_servers'),
+                            'enforcement_mode': item.get('enforcement_mode'),
+                            'parent_policy': item.get('parent_policy'),
+                            'vs_ip': enrich.get('vs_ip'),
+                            'vs_services': enrich.get('vs_services'),
+                            'vs_status': enrich.get('vs_status'),
+                            'pool_servers_status': enrich.get('pool_servers_status'),
+                            'auid': enrich.get('auid'),
+                            'pool_server': pool_server_instance,
+                        }
+                    )
+
+            # Borra los VS que ya no existen en la fuente (lo que hacia el delete)
+            F5Asm.objects.filter(region=region, instance=instance)\
+                .exclude(vs_name__in=seen).delete()
+
+            TaskUpdateDate.objects.create(name=f'updated_f5asm_{instance}')
+            self.stdout.write(self.style.SUCCESS("F5 ASM Table Updated"))
+
+        # Borra las filas antiguas que no tienen virtual server
+        # (p.ej. politicas 'parent' del modelo viejo, con virtual_servers = None)
+        F5Asm.objects.filter(virtual_servers__isnull=True).delete()
