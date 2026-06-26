@@ -1,0 +1,32 @@
+/* Columnas fijas — horizontal */
+.table-scroll th.sticky-col:nth-child(1),
+.table-scroll td.sticky-col:nth-child(1) {
+  position: sticky;
+  left: 0;
+  width: 60px; min-width: 60px; max-width: 60px;
+  background: #fff;
+  box-sizing: border-box;
+}
+.table-scroll th.sticky-col:nth-child(2),
+.table-scroll td.sticky-col:nth-child(2) {
+  position: sticky;
+  left: 60px;              /* = ancho de la columna 1 */
+  min-width: 150px;
+  background: #fff;
+  box-sizing: border-box;
+}
+
+/* Cabecera fija — vertical, sobre las celdas (no sobre el thead) */
+.table-scroll thead th {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: #fff;
+}
+
+/* Columnas fijas del cuerpo por encima de lo que scrollea
+   (esto tapa los badges/"show more") */
+.table-scroll tbody td.sticky-col { z-index: 1; }
+
+/* Las dos celdas de esquina son cabecera Y columna fija: capa superior */
+.table-scroll thead th.sticky-col { z-index: 3; }
