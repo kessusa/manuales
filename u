@@ -1,0 +1,28 @@
+<style>
+.avi-waf-scroll th.sticky-col:nth-child(1),
+.avi-waf-scroll td.sticky-col:nth-child(1) {
+  position: sticky; left: 0;
+  width: 60px; min-width: 60px; max-width: 60px;
+  box-sizing: border-box;
+}
+.avi-waf-scroll th.sticky-col:nth-child(2),
+.avi-waf-scroll td.sticky-col:nth-child(2) {
+  position: sticky; left: 60px;
+  min-width: 150px;
+  box-sizing: border-box;
+}
+
+.avi-waf-scroll thead th { position: sticky; top: 0; z-index: 2; }
+.avi-waf-scroll tbody td.sticky-col { z-index: 1; }
+.avi-waf-scroll thead th.sticky-col { z-index: 3; }
+
+/* Colores base */
+.avi-waf-scroll thead th.sticky-col { background-color: #fff; }
+.avi-waf-scroll tbody td.sticky-col { background-color: #fff; }
+.avi-waf-scroll tbody tr:nth-child(even) td.sticky-col { background-color: #f2f2f2; }
+
+/* Fila seleccionada: verde en TODA la fila (incluidas las celdas normales y las fijas) */
+.avi-waf-scroll tbody tr.selected > td {
+  background-color: #d1e7dd !important;   /* verde de table-success de Bootstrap 5 */
+}
+</style>
