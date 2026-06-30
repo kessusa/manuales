@@ -34,3 +34,21 @@
     background-color: #d1e7dd !important;
     background-image: none !important;
 }
+
+.table-scroll {
+    position: relative;
+    max-height: 500px;
+    overflow-y: auto;
+    overflow-x: auto;
+}
+
+#avi_waf_table thead th {
+    position: sticky;
+    top: 0;
+    background-color: #fff;
+    z-index: 20;
+}
+
+#avi_waf_table thead th.sticky-col {
+    z-index: 40;
+}
