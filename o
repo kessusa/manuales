@@ -1,0 +1,33 @@
+// Firewalls vs IPS Chart
+const ips_pie_ctx = document.getElementById('fw_vs_ips_chart');
+new Chart(ips_pie_ctx, {
+    type: 'pie',
+    data: {
+        labels: [
+            "Should have IPS and have IPS",
+            "Should have IPS and NOT have IPS"
+        ],
+        datasets: [{
+            data: [
+                "{{ fw_should_and_have_ips|default:0 }}",
+                "{{ fw_should_and_not_have_ips|default:0 }}"
+            ],
+            backgroundColor: [
+                'rgba(54, 162, 235, 0.4)',
+                'rgba(255, 35, 8, 0.4)'
+            ],
+            borderColor: [
+                'rgba(54, 162, 235)',
+                'rgba(255, 35, 8)'
+            ],
+            borderWidth: 1
+        }]
+    },
+    options: {
+        responsive: true,
+        plugins: {
+            title: { display: true, text: 'Firewalls Vs IPS' },
+            legend: { position: 'bottom' }
+        }
+    }
+});
