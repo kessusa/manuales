@@ -1,0 +1,63 @@
+# =========================================================================
+# METODOS NUEVOS PARA PlayflowsAPI (pegar dentro de la clase, en playflows.py)
+# Estilo identico al existente. SOLO LECTURA: show / match, nunca /write.
+# =========================================================================
+
+    def match_flows(self, sid, flows, tags, multi_match=False):
+        """Reglas que aplican a cada flujo via /commands (match-flow esta
+        deprecado). Flujos en formato 'src dst servicio'.
+        multi_match=False -> regla EFECTIVA por flujo (first match).
+        multi_match=True  -> 'set matchandcontinue': TODAS las reglas que
+        matchean, incluida la implicit drop, ordenadas por position.
+        OJO: el match puede evaluar contra PRODUCCION; una regla solo en
+        'upcoming' (pendiente de forceupdate) puede no aparecer aqui. La
+        cobertura sobre upcoming la da get_tag_rules + rule_candidates."""
+
+        commands = list(flows)
+        if multi_match:
+            commands = ['set matchandcontinue'] + commands
+
+        params = {
+            'sid': sid,
+            'commands': commands,
+            'tags': list(tags)
+        }
+        self.connection_args['json'] = params
+        response = requests.post(f'{self.base_url}/commands', **self.connection_args).json()
+
+        if response.get('status') != 'success':
+            return {}
+
+        result = {}
+        for item in response.get('data', []):
+            if item.get('type') != 'match-flow':
+                continue
+            if multi_match:
+                result.setdefault(item['flow'], []).append(item)
+            else:
+                result[item['flow']] = item
+
+        if multi_match:
+            for flow in result:
+                result[flow].sort(key=lambda r: int(r.get('position') or 999999))
+
+        return result
+
+    def get_tag_rules(self, sid, tag_name):
+        """Reglas del tag (version upcoming) via /show-rules, el mismo
+        endpoint ya probado en get_rule_by_id. Devuelve la lista de reglas
+        con src/dst/service (contents y names), position, rule-version y
+        disabled. Solo lectura."""
+
+        params = {
+            'sid': sid,
+            'tag': tag_name,
+            'version': 'upcoming',
+            'flavours': ['use_native']
+        }
+        self.connection_args['json'] = params
+        response = requests.post(f'{self.base_url}/show-rules', **self.connection_args).json()
+
+        if response.get('data'):
+            return response['data']
+        return []
