@@ -1,0 +1,501 @@
+# -*- coding: utf-8 -*-
+"""
+AGENTE DE PROPUESTAS DE FLUJOS DE FIREWALL.
+Ubicacion: API_cnx/fw_proposal_agent.py (junto a serenity.py, playflows.py
+y rule_candidates.py)
+
+Pipeline por cada AR del ticket:
+  1. Serenity -> datos del AR.
+  2. Validacion de admisibilidad (heuristicas + LLM).
+  3. Playflows /webapi/1.1/commands:
+       a. sin matchandcontinue  -> REGLA EFECTIVA (permitido si/no y por que)
+       b. con matchandcontinue  -> TODAS las reglas (analisis de genericidad)
+     En EMEA siempre; en CIS solo si hay tags CIS (como en tu view).
+  4. Si hace falta regla nueva: rule_candidates.analizar_candidatas ->
+     membresia real por IP, grupos candidatos (red + naming), reglas con
+     matching parcial, y propuesta con la sintaxis oficial de plantillas
+     (add to / set to / insert to / forceupdate). FW name = firewall_misc;
+     rule number = position.
+  5. Decision LLM: ya_permitido | reutilizar | nueva_regla | excepcion | denegar
+  6. Borrador de mail (NO se envia: aprobacion humana).
+"""
+
+import os
+import json
+import time
+import ipaddress
+from itertools import product
+
+import requests
+import urllib3
+
+from rule_candidates import (analizar_candidatas, afinidad_regla,
+                             tokens_contexto)
+
+urllib3.disable_warnings()
+
+# =========================================================================
+# LLM gateway interno (token SIEMPRE por entorno, nunca hardcodeado)
+# =========================================================================
+LLM_URL = "https://llm.auria.dev.echonet/remote/llm-at-cib/v1/chat/completions"
+LLM_API_KEY = os.environ["LLM_AT_CIB_TOKEN"]
+LLM_MODEL = "llama3.3-70b"
+MAX_RETRIES = 3
+
+DETERMINISTIC_ACTIONS = {"accept", "deny", "drop", "reject"}
+
+
+def _consume_stream(headers, data):
+    """Acumula la respuesta SSE. El streaming evita el 504: los tokens
+    fluyen desde el primer segundo y el proxy no corta la conexion."""
+    chunks = []
+    with requests.post(LLM_URL, headers=headers, json=data, verify=False,
+                       stream=True, timeout=(10, 600)) as r:
+        r.raise_for_status()
+        for raw in r.iter_lines():
+            if not raw:
+                continue
+            line = raw.decode("utf-8", errors="ignore")
+            if not line.startswith("data:"):
+                continue
+            payload = line[5:].strip()
+            if payload == "[DONE]":
+                break
+            try:
+                delta = (json.loads(payload)["choices"][0]
+                         .get("delta", {}).get("content") or "")
+                chunks.append(delta)
+            except (ValueError, KeyError, IndexError):
+                continue
+    return "".join(chunks)
+
+
+def llm_json(system, user, schema_keys=None, retries=MAX_RETRIES,
+             model=None, temperature=0):
+    """Llamada con streaming + validacion de esquema + reintento con feedback."""
+    headers = {"Authorization": "Bearer %s" % LLM_API_KEY,
+               "Content-Type": "application/json"}
+    system += ("\nResponde EXCLUSIVAMENTE con un objeto JSON valido. "
+               "Sin markdown, sin backticks, sin texto adicional.")
+    last_err = None
+    for attempt in range(retries):
+        data = {"model": model or LLM_MODEL, "stream": True,
+                "temperature": temperature,
+                "messages": [{"role": "system", "content": system},
+                             {"role": "user", "content": user}]}
+        try:
+            content = _consume_stream(headers, data)
+            clean = content.replace("```json", "").replace("```", "").strip()
+            result = json.loads(clean)
+            if schema_keys and not all(k in result for k in schema_keys):
+                raise ValueError("faltan claves: %s"
+                                 % (set(schema_keys) - set(result)))
+            return result
+        except Exception as e:                          # noqa: BLE001
+            last_err = str(e)
+            user += ("\n\nTu respuesta anterior fue invalida (%s). "
+                     "Corrige y devuelve SOLO el JSON." % last_err)
+            time.sleep(2 * (attempt + 1))
+    raise RuntimeError("LLM fallo tras %d intentos: %s" % (retries, last_err))
+
+
+# =========================================================================
+# Helpers sobre resultados de match_flows (metodo de TU PlayflowsAPI)
+# =========================================================================
+def build_flows(sources, destinations, services):
+    return ["%s %s %s" % (s, d, srv) for s, d, srv
+            in product(sources, destinations, services)]
+
+
+def is_implicit_drop(rule):
+    return (rule.get("action") == "drop" and not rule.get("id")
+            and "implicit" in (rule.get("comment") or "").lower())
+
+
+def deterministic(rules):
+    """Filtra vpn/auth/nat (match-and-continue)."""
+    return [r for r in rules if r.get("action") in DETERMINISTIC_ACTIONS]
+
+
+# =========================================================================
+# Heuristicas deterministas (gratis, antes de gastar LLM)
+# =========================================================================
+def regla_es_generica(regla):
+    # wideness de Playflows (0-100): >=60 es Wide rule
+    try:
+        if float(regla.get("wideness")) >= 60.0:
+            return True
+    except (TypeError, ValueError):
+        pass
+    src = str(regla.get("source", regla.get("flow", ""))).lower()
+    dst = str(regla.get("destination", "")).lower()
+    srv = str(regla.get("service", "")).lower()
+    if "any" in (src, dst) or srv in ("any", "*"):
+        return True
+    for campo in (src, dst):
+        try:
+            if ipaddress.ip_network(campo, strict=False).prefixlen <= 16:
+                return True
+        except ValueError:
+            pass
+    return False
+
+
+# =========================================================================
+# Prompts (aqui va VUESTRA politica real: iterar sobre esto)
+# =========================================================================
+POLICY_PROMPT = """Eres un analista de seguridad de red. Evaluas peticiones de
+apertura de flujos de firewall segun la politica interna:
+- No se permite any-to-any ni servicios 'any'.
+- Origen/destino deben ser IPs o redes concretas justificadas.
+- Flujos hacia zonas criticas requieren justificacion de negocio explicita.
+Devuelve JSON:
+{"admisible": true, "motivo": "", "riesgo": "bajo|medio|alto"}"""
+
+ESPECIFICIDAD_PROMPT = """Eres ingeniero de firewalls. Dado un flujo solicitado
+y las reglas que YA lo permiten (con afinidad: tokens de naming comunes con
+el flujo, seccion, comentario, wideness y es_wide_rule; escala wideness
+0-100: 100 no filtra nada, >=60 es "Wide rule" reservada a infraestructura),
+decide si la cobertura es adecuada:
+- Regla con es_wide_rule=true y afinidad score 0 = permisiva generica sin
+  relacion con este flujo: NO fiarse, se reducira en el futuro
+  -> crear_especifica.
+- En el FW de ORIGEN (rol_del_fw=origen) una regla amplia de salida es
+  practica habitual y aceptable; la especificidad se exige sobre todo en
+  el FW de DESTINO.
+- Regla con afinidad por naming/seccion con la aplicacion del flujo =
+  cobertura legitima -> usar_existente.
+Devuelve JSON:
+{"adecuada": true, "razon": "", "recomendacion": "usar_existente|crear_especifica"}
+Maximo 25 palabras por campo de texto."""
+
+DECISION_PROMPT = """Eres el motor de decision de un equipo de seguridad de
+red. Con la evidencia dada, decide UNA accion para el AR:
+- "ya_permitido": cubierto por reglas adecuadas en todos los flujos.
+- "reutilizar": aplicar la propuesta de actualizacion de grupo/regla
+  (referencia el objetivo de propuestas_por_tag en detalle).
+- "nueva_regla": proponer regla especifica (src/dst/srv en detalle).
+- "excepcion": viola politica pero hay justificacion; tramitar excepcion.
+- "denegar": rechazar.
+Las propuestas con "fuera_de_alcance" son tags/FWs que NO gestionamos: no
+proponemos codificacion ahi; si TODOS los tags son fuera_de_alcance, la
+accion correcta suele ser redirigir al equipo propietario (usa "detalle").
+Se conservador: ante dudas, "nueva_regla" o revision antes que bypass amplios.
+Devuelve JSON:
+{"accion": "", "detalle": "", "justificacion": ""}"""
+
+MAIL_PROMPT = """Redacta un email profesional y conciso en espanol para el
+solicitante del ticket explicando la decision sobre su peticion de flujo.
+Tono cordial, tecnico pero claro: numero de AR, decision, motivo y proximos
+pasos. Devuelve JSON: {"asunto": "", "cuerpo": ""}"""
+
+
+# =========================================================================
+# Pasos del pipeline
+# =========================================================================
+def validar_ar(ar_data):
+    problemas = [c for c in ("sources", "destinations", "services")
+                 if not ar_data.get(c)]
+    if problemas:
+        return {"admisible": False,
+                "motivo": "Faltan campos: %s" % ", ".join(problemas),
+                "riesgo": "n/a"}
+    resumen = {
+        "ar_number": ar_data.get("ar_number"),
+        "sources": [s.get("ip_address") for s in ar_data["sources"]],
+        "destinations": [d.get("ip_address") for d in ar_data["destinations"]],
+        "services": ar_data["services"],
+        "justificacion": ar_data.get("description", ""),
+    }
+    return llm_json(POLICY_PROMPT, json.dumps(resumen, ensure_ascii=False),
+                    schema_keys=["admisible", "motivo", "riesgo"])
+
+
+def analizar_en_playflows(pf, sid, flujo, fw_tags):
+    """Regla efectiva + multi-match por flujo con pf.match_flows
+    (2 llamadas batcheadas). pf: instancia de tu PlayflowsAPI."""
+    flows = build_flows(
+        flujo["sources"], flujo["destinations"], flujo["services"])
+    efectivas = pf.match_flows(sid, flows, fw_tags, multi_match=False)
+    multi = pf.match_flows(sid, flows, fw_tags, multi_match=True)
+
+    resultado = []
+    for f in flows:
+        efectiva = efectivas.get(f, {})
+        accepts = [r for r in deterministic(multi.get(f, []))
+                   if r.get("action") == "accept"]
+        resultado.append({
+            "flow": f,
+            "permitido": efectiva.get("action") == "accept",
+            "regla_efectiva": efectiva,
+            "no_permitido_implicit_drop":
+                is_implicit_drop(efectiva) if efectiva else False,
+            "reglas_accept": accepts,
+            "alguna_regla_generica": any(regla_es_generica(r)
+                                         for r in accepts),
+        })
+    return resultado
+
+
+def rol_del_tag(tag, fw_and_node_info, flujo):
+    """origen / destino / ambos: de que lado del flujo es este FW."""
+    en_src = any(fw_and_node_info.get(ip, {}).get("firewall_misc") == tag
+                 for ip in flujo["sources"])
+    en_dst = any(fw_and_node_info.get(ip, {}).get("firewall_misc") == tag
+                 for ip in flujo["destinations"])
+    if en_src and en_dst:
+        return "ambos"
+    return "origen" if en_src else ("destino" if en_dst else "desconocido")
+
+
+def evaluar_especificidad(flujo, analisis, fw_and_node_info):
+    """Solo llama al LLM para flujos permitidos con sospecha de genericidad,
+    aportando afinidad de naming y rol del FW en el flujo."""
+    dudosos = [a for a in analisis
+               if a["permitido"] and a["alguna_regla_generica"]]
+    if not dudosos:
+        return []
+    tokens_ctx = tokens_contexto(fw_and_node_info)
+    resultados = []
+    for a in dudosos:
+        reglas = []
+        for r in a["reglas_accept"]:
+            r = dict(r)
+            r["afinidad"] = afinidad_regla(r, tokens_ctx)
+            reglas.append(r)
+        tag_regla = (a["regla_efectiva"] or {}).get("tag", "")
+        resultados.append(llm_json(
+            ESPECIFICIDAD_PROMPT,
+            json.dumps({"flujo_solicitado": a["flow"],
+                        "rol_del_fw": rol_del_tag(tag_regla,
+                                                  fw_and_node_info, flujo),
+                        "reglas_que_lo_permiten": reglas},
+                       ensure_ascii=False),
+            schema_keys=["adecuada", "razon", "recomendacion"]))
+    return resultados
+
+
+# =========================================================================
+# Resumen final: to_code (todo lo que hay que codificar, listo para usar)
+# y already_open (reglas que ya permiten flujos + senales de calidad)
+# =========================================================================
+def construir_resumen(informes):
+    to_code, already_open = [], []
+    for inf in informes:
+        toks = tokens_contexto(inf.get("fw_and_node_info", {}))
+
+        # reglas que YA permiten flujos segun el match (produccion)
+        for a in (inf.get("analisis_emea", []) +
+                  inf.get("analisis_cis", [])):
+            if not a.get("permitido"):
+                continue
+            regla = a.get("regla_efectiva") or {}
+            already_open.append({
+                "ar_number": inf["ar_number"],
+                "flow": a["flow"],
+                "tag": regla.get("tag"),
+                "origen": "produccion (match)",
+                "regla": {k: regla.get(k)
+                          for k in ("id", "position", "section",
+                                    "comment", "action")},
+                # senales para juzgar si la regla es realmente buena:
+                "afinidad": afinidad_regla(regla, toks),
+                "regla_generica_o_wide": a.get("alguna_regla_generica"),
+            })
+
+        for p in inf.get("propuestas_tags", []):
+            # cobertura en upcoming (regla creada pendiente de push)
+            for r in (p.get("reglas_cobertura_total") or []):
+                already_open.append({
+                    "ar_number": inf["ar_number"],
+                    "flow": "cobertura total del flujo del AR",
+                    "tag": p.get("tag"),
+                    "origen": "upcoming (show-rules)",
+                    "regla": {k: r.get(k)
+                              for k in ("id", "position", "section",
+                                        "comment", "wideness")},
+                    "afinidad": r.get("afinidad"),
+                    "regla_generica_o_wide":
+                        (r.get("afinidad") or {}).get("es_wide_rule"),
+                })
+
+            # todo lo que hay que codificar
+            prop = p.get("propuesta") or {}
+            if prop.get("propuesta") in ("actualizar_grupo",
+                                         "actualizar_regla",
+                                         "nueva_regla") \
+                    and prop.get("cambios"):
+                lineas = []
+                for g in (prop.get("grupos_nuevos") or []):
+                    if g.get("nombre"):
+                        lineas.append(g["nombre"])
+                        lineas += ["    %s" % ip
+                                   for ip in (g.get("ips") or [])]
+                        lineas.append("")
+                lineas += prop["cambios"]
+                to_code.append({
+                    "ar_number": inf["ar_number"],
+                    "fw": p.get("tag"),
+                    "tipo": prop.get("propuesta"),
+                    "objetivo": prop.get("objetivo"),
+                    "grupos_nuevos": prop.get("grupos_nuevos") or [],
+                    "cambios": prop.get("cambios"),
+                    "riesgos": prop.get("riesgos", ""),
+                    # bloque listo para pegar (grupos + comandos), como
+                    # vuestras plantillas de Notepad
+                    "bloque_texto": "\n".join(lineas),
+                })
+    return to_code, already_open
+
+
+# =========================================================================
+# Orquestador
+# =========================================================================
+def procesar_ticket(ticket_id, include_cis=True):
+    """Devuelve un informe por AR, listo para revision humana (modo sombra).
+    include_cis: pasa aqui el resultado de _user_in_groups(request.user,
+    ['emea_netsec']) cuando lo llames desde la view."""
+    from serenity import SerenityAPI
+    from playflows import PlayflowsAPI
+    from rss.models import PlayflowsTag   # ajusta a tu ruta real del modelo
+
+    serenity = SerenityAPI(env="prd")
+    ars = sorted(serenity.get_data(ticket_id) or [],
+                 key=lambda x: int(x["ar_number"]))
+
+    pf_emea = PlayflowsAPI()
+    sid = pf_emea.get_sid()
+
+    pf_cis, sid_cis = None, None
+
+    informes = []
+    try:
+        for ar_data in ars:
+            flujo = {
+                "sources": [s["ip_address"] for s in ar_data["sources"]],
+                "destinations": [d["ip_address"]
+                                 for d in ar_data["destinations"]],
+                "services": ar_data["services"],
+            }
+
+            # info por nodo, igual que fw_and_node_info en tu view.
+            # Cuando tengas el enriquecimiento de Serenity, anade aqui
+            # claves extra (p.ej. 'application'): candidate_groups las
+            # tokeniza todas automaticamente para el scoring de naming.
+            fw_and_node_info = {}
+            for ip in flujo["sources"] + flujo["destinations"]:
+                info = pf_emea.get_node_name(ip, sid) or {}
+                fw_and_node_info[ip] = {
+                    "ip_address": info.get("ip_address", ip),
+                    "node_normalization":
+                        info.get("node_normalization", ""),
+                    "firewall_misc":
+                        (info.get("firewall_misc") or "").strip(),
+                }
+
+            fw_tags = sorted({v["firewall_misc"]
+                              for v in fw_and_node_info.values()
+                              if v["firewall_misc"]})
+
+            # 1. Admisibilidad
+            validacion = validar_ar(ar_data)
+
+            analisis, especificidad = [], []
+            analisis_cis, propuestas_tags = [], []
+            if validacion.get("admisible"):
+                # 2-3. EMEA siempre
+                analisis = analizar_en_playflows(pf_emea, sid, flujo,
+                                                 fw_tags)
+                especificidad = evaluar_especificidad(flujo, analisis,
+                                                      fw_and_node_info)
+
+                # 2b. CIS solo si procede (mismo criterio que tu view)
+                tags_cis = list(PlayflowsTag.objects.filter(
+                    region="cis", tag_name__in=fw_tags)
+                    .values_list("tag_name", flat=True))
+                if include_cis and tags_cis:
+                    if pf_cis is None:
+                        pf_cis = PlayflowsAPI(env="cis")
+                        sid_cis = pf_cis.get_sid()
+                    analisis_cis = analizar_en_playflows(
+                        pf_cis, sid_cis, flujo, tags_cis)
+
+                # 4. Candidatas de reutilizacion + propuesta por tag.
+                # Cada tag se consulta contra SU entorno (cis vs emea) y se
+                # pasan las reglas que ya permiten flujos hermanos del AR.
+                necesita_regla = (
+                    any(not a["permitido"] for a in analisis + analisis_cis)
+                    or any(e.get("recomendacion") == "crear_especifica"
+                           for e in especificidad))
+                if necesita_regla:
+                    tags_cis_set = set(tags_cis)
+                    propuestas_tags = []
+                    for tag in fw_tags:
+                        if tag in tags_cis_set and pf_cis is not None:
+                            pf_t, sid_t = pf_cis, sid_cis
+                            analisis_t = analisis_cis
+                        else:
+                            pf_t, sid_t = pf_emea, sid
+                            analisis_t = analisis
+                        hermanas = [r for a in analisis_t
+                                    for r in a["reglas_accept"]
+                                    if r.get("tag") == tag]
+                        propuestas_tags.append(analizar_candidatas(
+                            pf_t, sid_t, tag, flujo, fw_and_node_info,
+                            llm_json, reglas_mismo_ar=hermanas,
+                            rol_fw=rol_del_tag(tag, fw_and_node_info,
+                                               flujo),
+                            ticket_id=ticket_id))
+
+            # 5. Decision
+            evidencia = {"flujo": flujo, "validacion": validacion,
+                         "analisis_emea": analisis,
+                         "analisis_cis": analisis_cis,
+                         "especificidad": especificidad,
+                         "propuestas_por_tag": propuestas_tags}
+            decision = llm_json(
+                DECISION_PROMPT, json.dumps(evidencia, ensure_ascii=False),
+                schema_keys=["accion", "detalle", "justificacion"])
+
+            # 6. Borrador de mail
+            mail = llm_json(
+                MAIL_PROMPT,
+                json.dumps({"ticket": ticket_id,
+                            "ar": ar_data["ar_number"],
+                            "decision": decision}, ensure_ascii=False),
+                schema_keys=["asunto", "cuerpo"], temperature=0.4)
+
+            informes.append({"ar_number": ar_data["ar_number"],
+                             "flujo": flujo,
+                             "fw_and_node_info": fw_and_node_info,
+                             "validacion": validacion,
+                             "analisis_emea": analisis,
+                             "analisis_cis": analisis_cis,
+                             "especificidad": especificidad,
+                             "propuestas_por_tag": propuestas_tags,
+                             "decision": decision,
+                             "mail_borrador": mail})
+    finally:
+        pf_emea.logout(sid)
+        if pf_cis is not None:
+            pf_cis.logout(sid_cis)
+
+    to_code, already_open = construir_resumen(informes)
+    return {"ticket_id": ticket_id,
+            "informes": informes,
+            "to_code": to_code,
+            "already_open": already_open}
+
+
+if __name__ == "__main__":
+    import sys
+    import django
+
+    # bootstrap de Django para ejecucion standalone
+    proyecto = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    sys.path.insert(0, proyecto)
+    os.environ.setdefault("DJANGO_SETTINGS_MODULE", "bookmark.settings")
+    django.setup()
+
+    print(json.dumps(procesar_ticket(sys.argv[1], include_cis=True),
+                     indent=2, ensure_ascii=False))
