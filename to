@@ -1,0 +1,52 @@
+# -*- coding: utf-8 -*-
+"""
+Herramientas de Playflows. Este fichero es el patrón a copiar cuando
+añadas Elastic, AbuseIPDB, WAF, etc.: un módulo = un dominio de tools.
+"""
+
+
+def register_playflows_tools(registry, playflows_api):
+    """Registra las tools de Playflows en el registry del agente."""
+    state = {"sid": None}
+
+    def _sid():
+        if not state["sid"]:
+            state["sid"] = playflows_api.get_sid()
+        return state["sid"]
+
+    @registry.tool(
+        name="get_firewall_for_ip",
+        description="Devuelve el firewall/tag/zona asociado a una IP (topología).",
+        params={"ip": "IP address, e.g. 10.24.140.99"},
+    )
+    def get_firewall_for_ip(ip):
+        return playflows_api.get_node_name(ip, _sid())
+
+    @registry.tool(
+        name="list_rules_in_tag",
+        description="Lista las reglas de firewall de un tag/zona concreto.",
+        params={"tag": "tag or zone name returned by get_firewall_for_ip"},
+    )
+    def list_rules_in_tag(tag):
+        rules = playflows_api.get_tag_rules(_sid(), tag)
+        return [
+            {
+                "pos": r.get("position"),
+                "action": r.get("action"),
+                "service": r.get("service"),
+                "src": r.get("source_names"),
+                "dst": r.get("destination_names"),
+            }
+            for r in rules
+        ]
+
+
+# --- Plantilla para el siguiente paso (Elasticsearch) ---
+# def register_elastic_tools(registry, es_client):
+#     @registry.tool(
+#         name="search_logs",
+#         description="Busca logs en Elasticsearch para una IP o sesión.",
+#         params={"query": "lucene/KQL query", "index": "index pattern"},
+#     )
+#     def search_logs(query, index="logs-*"):
+#         return es_client.search(index=index, q=query, size=20)["hits"]["hits"]
