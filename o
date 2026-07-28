@@ -1,0 +1,11 @@
+SELECT setval(pg_get_serial_sequence('pf_tag_group', 'id'),
+              (SELECT MAX(id) FROM pf_tag_group));
+
+SELECT setval(pg_get_serial_sequence('pf_tag_group_link', 'id'),
+              (SELECT MAX(id) FROM pf_tag_group_link));
+
+-- y de paso, la nueva tabla y pf_tag si insertáis en ella:
+SELECT setval(pg_get_serial_sequence('pf_tag_group_relation', 'id'),
+              COALESCE((SELECT MAX(id) FROM pf_tag_group_relation), 1));
+SELECT setval(pg_get_serial_sequence('pf_tag', 'tag_id'),
+              (SELECT MAX(tag_id) FROM pf_tag));
