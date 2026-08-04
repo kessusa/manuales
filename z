@@ -1,0 +1,111 @@
+import os
+from collections import defaultdict
+from pathlib import Path
+
+import pandas as pd
+from django.conf import settings
+from django.core.management.base import BaseCommand
+from django.db.models import CharField, F, Q, Value
+from django.db.models.functions import Concat
+
+from rss.models import PlayflowsRule
+
+REGIONS = ['emea', 'amer', 'apac', 'cis', 'itg']
+FOLDER = 'per_device_mapping'
+
+HEADERS = ['ADOM', 'POLICIES', 'OBJECTS', 'RULES ID',
+           'COUNT PER FIREWALL', 'COUNT PER ADOM']
+
+
+class Command(BaseCommand):
+    help = 'Generates the per-device-mapping CSV files (one per region) in MEDIA_ROOT'
+
+    def add_arguments(self, parser):
+        parser.add_argument('--region', action='append', dest='regions',
+                            help='Specific region (repeatable). Default: all.')
+
+    # ------------------------------------------------------------------ datos
+    def get_queryset(self, region):
+        return (PlayflowsRule.objects.filter(
+                    ~Q(per_device_mapping__groups=[]),
+                    tag__region=region,
+                    tag__deleted=False,
+                    deleted=False,
+                    per_device_mapping__isnull=False,
+                    per_device_mapping__groups__isnull=False,
+                ).select_related(
+                    'tag',
+                ).annotate(
+                    f_comment_id=Concat(Value('ID-'), F('comment_id'),
+                                        output_field=CharField()),
+                    domain=F('tag__domain'),
+                    tag_name=F('tag__tag_name'),
+                ).values(
+                    'f_comment_id',
+                    'per_device_mapping',
+                    'tag_name',
+                    'domain',
+                ).order_by('tag__domain'))
+
+    def build_table(self, region):
+        # domain -> policy (tag_name) -> datos
+        adoms = defaultdict(lambda: defaultdict(lambda: {
+            'objects': set(), 'rules': set(),
+        }))
+
+        for r in self.get_queryset(region).iterator(chunk_size=2000):
+            groups = (r['per_device_mapping'] or {}).get('groups') or []
+            if not groups:
+                continue
+            policy = adoms[r['domain'] or '-'][r['tag_name']]
+            policy['objects'].update(groups)
+            policy['rules'].add(r['f_comment_id'])
+
+        table = []
+        for domain, policies in sorted(adoms.items()):
+            names = sorted(policies)
+
+            all_objects = set()
+            policy_rules = []
+            for name in names:
+                all_objects |= policies[name]['objects']
+                ids = ','.join(sorted(policies[name]['rules']))
+                policy_rules.append(f'{name}:{ids}')
+
+            table.append({
+                'ADOM': domain,
+                'POLICIES': self.join(names),
+                'OBJECTS': self.join(sorted(all_objects)),
+                'RULES ID': self.join(policy_rules),
+                'COUNT PER FIREWALL': self.join(
+                    f'{n}: {len(policies[n]["objects"])}' for n in names),
+                'COUNT PER ADOM': len(all_objects),
+            })
+        return table
+
+    @staticmethod
+    def join(values):
+        # sin truncado: CSV no tiene el limite de 32.767 chars de Excel
+        return '\n'.join(str(v) for v in values)
+
+    # ------------------------------------------------------------------ main
+    def handle(self, *args, **options):
+        regions = options['regions'] or REGIONS
+
+        folder = Path(settings.MEDIA_ROOT) / FOLDER
+        folder.mkdir(parents=True, exist_ok=True)
+
+        for region in regions:
+            final_path = folder / f'per_device_mapping_{region}.csv'
+            tmp_path = final_path.with_suffix('.csv.tmp')
+
+            try:
+                df = pd.DataFrame(self.build_table(region), columns=HEADERS)
+                df.to_csv(tmp_path, index=False, encoding='utf-8-sig')
+                os.replace(tmp_path, final_path)
+            except Exception:
+                Path(tmp_path).unlink(missing_ok=True)
+                raise
+
+            self.stdout.write(self.style.SUCCESS(
+                f'OK {region}: {len(df)} ADOMs -> {final_path}'))
