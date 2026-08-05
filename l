@@ -26,3 +26,18 @@
                             result = rule_response.json()
                             result['policy_packages'] = [package_name]
                             break
+
+
+
+# nat rules : original / translated columns hold a single
+            # object each (not a list like access rules)
+            elif detail.get('type') == 'nat-rule':
+                result['original_source'] = self.describe_reference(url, sid, detail.get('original-source', None))
+                result['original_destination'] = self.describe_reference(url, sid, detail.get('original-destination', None))
+                result['original_service'] = self.describe_reference(url, sid, detail.get('original-service', None))
+                result['translated_source'] = self.describe_reference(url, sid, detail.get('translated-source', None))
+                result['translated_destination'] = self.describe_reference(url, sid, detail.get('translated-destination', None))
+                result['translated_service'] = self.describe_reference(url, sid, detail.get('translated-service', None))
+                result['method'] = detail.get('method', None)
+                result['enabled'] = detail.get('enabled', None)
+                result['policy_packages'] = detail.get('policy_packages', [])
