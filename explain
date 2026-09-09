@@ -1,0 +1,299 @@
+# Workflow de llamadas paso a paso — `get_pending_changes`
+
+Recorrido completo de una ejecución real: qué llama a qué, en qué orden y **por qué**
+cada llamada es necesaria.
+
+## Escenario de ejemplo
+
+En el dominio `ETS-UK`, desde la última instalación, un compañero ha publicado
+dos sesiones:
+
+- **Sesión A** (09:15, "add scanner to group"): añade la IP `10.1.222.14` al grupo
+  `ADDM_Scanners_ETS`.
+- **Sesión B** (11:30, "new access rule"): crea una regla de acceso con
+  source `ADDM_Scanners_ETS`, destination `10.15.5.0/24` y service `Any`.
+
+Punto de entrada:
+
+```python
+obj_mds = CheckPoint()
+results = obj_mds.get_pending_changes(obj_mds.base_url_v1, 'ETS-UK', from_date='2026-08-06')
+print(obj_mds.format_pending_changes(results))
+```
+
+---
+
+## PASO 1 — Abrir sesión en el dominio
+
+```
+get_pending_changes()
+  └─> self.auth_credentials['domain'] = 'ETS-UK'
+  └─> login(url)  ───────────────────>  POST /login
+```
+
+**Por qué:** en un MDS el sid está atado a un dominio concreto. Si haces login sin
+dominio (o en otro), `show-changes` no verá nada de `ETS-UK`.
+
+**Por qué `login` reasigna las credenciales:** `connection_args['json']` es
+compartido y otros métodos lo sobrescriben. Sin esa línea, un `logout` anterior
+dejaría `{'sid': ...}` en el body y el login fallaría con `KeyError: 'sid'`.
+
+**Devuelve:** `sid` — a partir de aquí viaja en el header `X-chkp-sid` de todo.
+
+---
+
+## PASO 2 — Pedir los cambios publicados
+
+```
+  └─> POST /show-changes   {from-date, limit, details-level: 'full'}
+      respuesta: {'task-id': 'abcdef01-...'}
+```
+
+**Por qué `details-level: 'full'`:** es la clave de todo. Sin él, los objetos
+borrados y el `old-object` de los modificados llegan pelados (solo uid y tipo) y
+sería imposible describirlos. Con él, viene la **definición completa inline**.
+
+**Por qué no hay datos todavía:** `show-changes` es **asíncrono**. Solo devuelve un
+task-id. (Este fue uno de los descubrimientos que costó depuración: el bucle sobre
+`changes` salía siempre vacío.)
+
+---
+
+## PASO 3 — Esperar la tarea
+
+```
+  └─> wait_for_task(url, sid, task_id)
+        └─> POST /show-task  (cada 2 s hasta status != 'in progress')
+```
+
+**Por qué el polling:** el servidor construye el informe en segundo plano. Al
+terminar, los cambios están en `task['task-details'][0]['changes']`.
+
+**Estructura que llega:**
+
+```
+task-details[0].changes[]
+  ├─ [0] session (A) + operations.modified-objects[]  → grupo ADDM
+  └─ [1] session (B) + operations.added-objects[]     → regla nueva
+```
+
+---
+
+## PASO 4 — Aplanar en un timeline
+
+```
+  timeline = [
+    (09:15, 'modified', {new-object, old-object}, session_A),
+    (11:30, 'added',    {uid, type, ...},         session_B)
+  ]
+  timeline.sort()
+```
+
+**Por qué:** para calcular el **neto** hay que reproducir los cambios en orden
+cronológico. Cada operación arrastra su `session_info` (usuario, comentario, fecha)
+para no perder la trazabilidad al colapsar.
+
+---
+
+## PASO 5 — Replay por uid
+
+```
+  pending = {
+    'uid-grupo-ADDM': {modified: True, first_previous: <old-object>, last_definition: <new-object>, sessions: [A]},
+    'uid-regla-nueva': {added: True, last_definition: <inline>, sessions: [B]}
+  }
+```
+
+**Por qué:** es donde se decide qué llegará al firewall. Si un objeto se hubiera
+creado y borrado dentro del rango, o modificado y revertido, aquí queda registrado
+para descartarlo después. `first_previous` guarda el estado **anterior al primer
+cambio**, que es justo lo que hay instalado ahora.
+
+---
+
+## PASO 6 — Resolver el objeto: la regla (rama `added`)
+
+```
+  └─> get_object_details(url, sid, 'uid-regla-nueva')
+        ├─ ¿está en self._cache? NO
+        ├─> POST /show-object  {uid, details-level: full}
+        │     respuesta: type = 'access-rule', layer = 'c8d7dfcb-...'
+        ├─> POST /show-access-rule  {uid, layer, details-level: full}
+        │     (necesario: show-object no devuelve source/destination/service)
+        └─> get_layer_packages(url, sid, layer)
+              └─> get_all_packages()  ──> POST /show-packages   [CACHEADO]
+                  → busca el layer entre los access-layers de cada paquete
+                  → 'EMEA_UK_STG_DMZI_APPL_MKT-ETS'
+```
+
+**Por qué dos llamadas para una regla:** `show-object` identifica el objeto y da su
+layer, pero no sus columnas. `show-access-rule` sí, pero exige el layer. De ahí el
+encadenado.
+
+**Por qué `get_all_packages` está cacheado:** con 10 reglas en el push, sin caché
+serían 10 descargas de la lista completa de paquetes. Ahora es 1.
+
+**Si fuera una NAT:** `show-nat-rule` exige el **package** (no el layer), y
+`show-object` no lo devuelve → se prueban los paquetes del dominio hasta acertar.
+
+**Si el objeto ya no existiera** (creado y borrado después): `show-object` devuelve
+`None` → se usa `last_definition`, la definición inline. Es el patrón
+**"por uid si existe, inline si no"**.
+
+---
+
+## PASO 7 — Resumir la regla
+
+```
+  └─> summarize_object(url, sid, <regla>)
+        ├─> get_names(source)       → ['ADDM_Scanners_ETS']
+        ├─> get_names(destination)  → ['10.15.5.0/24']
+        ├─> get_names(service)      → ['Any']
+        └─> collect_group_members(source + destination + service)
+              └─ 'ADDM_Scanners_ETS' es un grupo
+                 └─> expand_group_members(members, parent_uid)
+                       ├─ los miembros llegan como uids sueltos
+                       └─> get_group_full()  ──> POST /show-group  {details-level: full}
+                             → devuelve los 5 miembros COMO OBJETOS COMPLETOS
+                             → 1 llamada en vez de 5   [BULK]
+                             → si un miembro fuera otro grupo: recursión (1 llamada más)
+```
+
+**Por qué el bulk:** sin él, cada miembro era un `show-object` (problema N+1). Un
+grupo de 50 hosts pasaba de 51 llamadas a 1.
+
+**Por qué `Any` no dispara nada:** no es un grupo, no hay nada que expandir.
+
+**Resultado:**
+
+```python
+{'type': 'access-rule', 'uid': '...', 'position': 3,
+ 'source': ['ADDM_Scanners_ETS'], 'destination': ['10.15.5.0/24'],
+ 'service': ['Any'], 'action': 'Accept', 'enabled': True,
+ 'group_members': {'ADDM_Scanners_ETS': ['10.1.222.14', '10.1.237.83', ...]}}
+```
+
+---
+
+## PASO 8 — Resolver el objeto: el grupo (rama `modified`)
+
+```
+  └─> get_object_details(url, sid, 'uid-grupo-ADDM')
+        └─ ¡CACHE HIT! ya se resolvió al expandir la regla del paso 7 → 0 llamadas
+
+  └─> summarize_object(<grupo actual>)
+        └─> expand_group_members(...)  → CACHE HIT del show-group → 0 llamadas
+
+  └─> summarize_object(<first_previous>)   # estado instalado
+        → members SIN la IP nueva
+
+  └─> diff_summaries(previo, actual)
+        → ["'10.1.222.14' added"]
+
+  └─> ¿diff vacío?  NO → el cambio se mantiene
+      (si estuviera vacío = modificado y revertido → se descarta)
+
+  └─> get_affected_rules(url, sid, 'uid-grupo-ADDM')
+        └─> POST /where-used  {uid}
+              → used-directly:   la regla nueva del paso 6
+              → used-indirectly: reglas que usan grupos que contienen este grupo
+```
+
+**Por qué las cachés brillan aquí:** el mismo grupo ya se había resuelto y expandido
+al procesar la regla. Sin caché, todo se repetiría.
+
+**Por qué `where-used`:** cuando cambia un grupo, las reglas que lo usan no aparecen
+como "modificadas" (no cambió su definición), pero **su comportamiento sí cambia**.
+El revisor necesita ver el impacto real.
+
+**Por qué solo para no-reglas:** una regla se explica sola; un grupo compartido, no.
+
+---
+
+## PASO 9 — Cerrar sesión y devolver
+
+```
+  └─> logout(url, sid)  ──> POST /logout   (sid en el header)
+  └─> return [ <regla>, <grupo> ]
+```
+
+---
+
+## PASO 10 — Formatear (sin llamadas)
+
+```
+format_pending_changes(results)   → 0 llamadas API, solo texto
+```
+
+```
+The following changes will be installed on the next policy push:
+
+[NEW] Access rule 'ed4ef60b-...' (package: EMEA_UK_STG_DMZI_APPL_MKT-ETS)
+    Position    : 3
+    Source      : ADDM_Scanners_ETS
+    Destination : 10.15.5.0/24
+    Service     : Any
+    Action      : Accept
+    Group 'ADDM_Scanners_ETS' resolves to: 10.1.222.14, 10.1.237.83, ...
+    Published by e76647 on 2026-08-06T11:30+0000 - "new access rule"
+
+[MODIFIED] Group 'ADDM_Scanners_ETS'
+    Members     : 10.1.222.14, 10.1.237.83, ...
+    Changes:
+        - '10.1.222.14' added
+    Resolves to : 10.1.222.14, 10.1.237.83, ...
+    Impacts rule 'ed4ef60b-...' (position 3, package EMEA_UK_STG_DMZI_APPL_MKT-ETS, direct use)
+    Published by e76647 on 2026-08-06T09:15+0000 - "add scanner to group"
+```
+
+---
+
+## Resumen del árbol de llamadas
+
+```
+get_pending_changes
+├── login                                    POST /login
+├── show-changes                             POST /show-changes      [asíncrono]
+├── wait_for_task                            POST /show-task         [xN polling]
+│
+├── [timeline + replay]                      sin llamadas
+│
+├── por cada objeto del neto:
+│   ├── get_object_details                   POST /show-object       [cacheado]
+│   │   ├── access-rule → show-access-rule   POST /show-access-rule
+│   │   │   └── get_layer_packages
+│   │   │       └── get_all_packages         POST /show-packages     [cacheado]
+│   │   └── nat-rule → show-nat-rule         POST /show-nat-rule     [prueba paquetes]
+│   │
+│   ├── summarize_object
+│   │   ├── get_names                        (resuelve uids sueltos)
+│   │   └── collect_group_members
+│   │       └── expand_group_members
+│   │           └── get_group_full           POST /show-group        [BULK + cacheado]
+│   │               └── (recursivo si hay grupos anidados)
+│   │
+│   ├── diff_summaries                       sin llamadas
+│   ├── resolve_inline_packages              (solo si el objeto ya no existe)
+│   └── get_affected_rules                   POST /where-used        [cacheado]
+│
+└── logout                                   POST /logout
+```
+
+---
+
+## Cuenta de llamadas del ejemplo
+
+| Llamada | Veces | Nota |
+|---|---|---|
+| `/login` | 1 | |
+| `/show-changes` | 1 | |
+| `/show-task` | 2-3 | polling |
+| `/show-object` | 2 | regla + grupo (el grupo, cacheado en su 2ª aparición) |
+| `/show-access-rule` | 1 | |
+| `/show-packages` | 1 | cacheado para el resto de la ejecución |
+| `/show-group` | 1 | bulk: 5 miembros en 1 llamada |
+| `/where-used` | 1 | solo para el grupo |
+| `/logout` | 1 | |
+
+**Total: ~11 llamadas.** Sin bulk ni cachés serían más de 25 para el mismo escenario,
+y la diferencia crece de forma no lineal con el tamaño de los grupos.
