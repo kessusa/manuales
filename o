@@ -1,0 +1,42 @@
+// Firewalls vs IPS Chart
+const fwIpsLabels = [
+    "Should have IPS and have IPS",
+    "Should have IPS and NOT have IPS",
+];
+
+const fwIpsDatasets = [
+    {% for value in fw_ips_chart %}
+        {
+            label: "{{ value.region|upper }}",
+            data: [
+                "{{ value.count_have_ips }}",
+                "{{ value.count_not_have_ips }}",
+            ],
+            backgroundColor:
+                {% if value.region == 'apac' %} 'rgb(255, 213, 20, 0.4)'
+                {% elif value.region == 'amer' %} 'rgba(255, 35, 8, 0.4)'
+                {% elif value.region == 'cis' %} 'rgba(0, 145, 90, 0.4)'
+                {% elif value.region == 'emea' %} 'rgba(54, 162, 235, 0.4)'
+                {% else %} 'rgba(150, 99, 224, 0.4)'
+                {% endif %},
+            borderColor:
+                {% if value.region == 'apac' %} 'rgb(255, 213, 20)'
+                {% elif value.region == 'amer' %} 'rgba(255, 35, 8)'
+                {% elif value.region == 'cis' %} 'rgba(0, 145, 90)'
+                {% elif value.region == 'emea' %} 'rgba(54, 162, 235)'
+                {% else %} 'rgba(150, 99, 224)'
+                {% endif %},
+            borderWidth: 1,
+        },
+    {% endfor %}
+];
+
+const fwIpsCtx = document.getElementById('fws_vs_ips_chart');
+new Chart(fwIpsCtx, {
+    type: 'bar',
+    data: {
+        labels: fwIpsLabels,
+        datasets: fwIpsDatasets
+    },
+    options: _BarConfig
+});
