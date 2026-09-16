@@ -1,0 +1,28 @@
+} else if (activeTab === 'pills-fwsips') {
+        const region_tab = `
+            <table class="table table-responsive table-striped w-100 ">
+                <thead>
+                    <th class="text-primary fw-lighter" scope="col"></th>
+                    ${fws_ips_labels.map(label => `<th class="text-primary fw-lighter" scope="col">${label}</th>`).join('')}
+                    <th class="text-primary fw-lighter" scope="col">Total Firewalls</th>
+                </thead>
+                <tbody id="details_body">
+                </tbody>
+            </table>
+        `;
+
+        $('#show-details').html(region_tab);
+        regions.forEach(region => {
+            const dataset_fwsips = datasets_fwsips.find(dataset_fwsips => dataset_fwsips.label === region);
+            if (dataset_fwsips) {
+                const total_fws = parseInt(dataset_fwsips.data[0]) + parseInt(dataset_fwsips.data[1]);
+                const region_row = '<tr>' +
+                    '<td><span class="badge badge-sm ' + _MAP_regions[region] + '">' + dataset_fwsips.label + '</span></td>' +
+                    '<td>' + dataset_fwsips.data[0] + '</td>' +
+                    '<td>' + dataset_fwsips.data[1] + '</td>' +
+                    '<td>' + total_fws + '</td>' +
+                    '</tr>';
+                $('#details_body').append(region_row);
+            }
+        });
+    }
