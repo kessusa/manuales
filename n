@@ -1,0 +1,11 @@
+from API_cnx.llm_api import LlmApi, NO_THINK
+
+llm = LlmApi()
+verdict = llm.ask_json(prompt, system=WAF_SYSTEM_PROMPT)
+
+message = llm.chat(messages, model='reasoner', tools=schemas, reasoning_effort=NO_THINK)
+if message and message.get('tool_calls'):
+    messages.append(LlmApi.assistant_message(message))
+    for tool_call in message['tool_calls']:
+        result = registry.run(tool_call['function']['name'], **tool_call['function']['arguments'])
+        messages.append(LlmApi.tool_result_message(tool_call['id'], result))
