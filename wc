@@ -1,0 +1,90 @@
+# =============================================================================
+# API_cnx/playflows.py -> PlayflowsAPI.get_groups_with_content
+# Replaces the previous version. Also remove:
+#   - resolve_group_members (**To Be Removed**: no longer used)
+#   - the if __name__ == '__main__' test block at the end of the file
+# =============================================================================
+
+def get_groups_with_content(self, sid, tag_name):
+    """
+    Return every group of a playflows tag with its DIRECT members, split by kind.
+
+    Nested groups are NOT resolved here: each subgroup is returned by name in
+    'subgroups' and has its own entry in the result, so the sync command can
+    store the hierarchy explicitly (PlayflowsTagGroup.children).
+
+    Returns:
+        dict | None: {
+            group_name: {
+                'type': 'ip' | 'service' | 'unknown',
+                'ips': [str],        # direct address values
+                'services': [str],   # direct service values ('S_' prefix removed)
+                'subgroups': [str],  # names of member groups
+            }
+        }
+        None when the API call fails or the tag has no data.
+    """
+    params = {
+        'sid': sid,
+        'commands': [f'show objects {tag_name} groups name-to-values'],
+        'version': 'upcoming',
+    }
+    # Copy instead of mutating self.connection_args: keeps the method stateless
+    request_args = {**self.connection_args, 'json': params}
+    response = requests.post(f'{self.base_url}/commands', **request_args).json()
+
+    if response.get('status') != 'success':
+        return None
+
+    data = response.get('data', [])
+    if not data:
+        return None
+    data = data[0]
+
+    groups_info = (
+        data.get('groups', {}).get(tag_name, {})
+        .get('upcoming', {}).get('members-of', {})
+    )
+    name_to_values = (
+        data.get('name-to-values', {}).get(tag_name, {})
+        .get('upcoming', {})
+    )
+    address_map = name_to_values.get('address', {})
+    service_map = name_to_values.get('service', {})
+
+    groups_with_content = {}
+
+    for group_name, members in groups_info.items():
+        member_names = list(members.keys()) if members else []
+
+        ips = set()
+        services = set()
+        subgroups = set()
+
+        for member in member_names:
+            if member in groups_info:
+                subgroups.add(member)
+            elif member in address_map:
+                ips.update(address_map[member].keys())
+            elif member in service_map:
+                for service_key in service_map[member].keys():
+                    services.add(
+                        service_key[2:] if service_key.startswith('S_') else service_key
+                    )
+
+        # A pure container of subgroups is a network group: type 'ip'
+        if ips or subgroups:
+            group_type = 'ip'
+        elif services:
+            group_type = 'service'
+        else:
+            group_type = 'unknown'
+
+        groups_with_content[group_name] = {
+            'type': group_type,
+            'ips': sorted(ips),
+            'services': sorted(services),
+            'subgroups': sorted(subgroups),
+        }
+
+    return groups_with_content
