@@ -1,0 +1,9 @@
+<div class="{% if is_root %}fw-bold text-primary mb-1{% else %}fw-bold text-secondary mt-2{% endif %}">{{ node.group_name }}</div>
+<div class="ps-4">
+    {% for ip in node.ips %}
+        <div class="text-secondary">{{ ip }}</div>
+    {% endfor %}
+    {% for child in node.subgroups %}
+        {% include 'search_components/group_lookup_node.html' with node=child is_root=False %}
+    {% endfor %}
+</div>
