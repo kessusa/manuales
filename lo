@@ -1,0 +1,173 @@
+"""
+Read-only diagnostic: compare each operation of the latest migration of an app
+against the live database schema. It never writes to the database.
+Never run it against PROD.
+
+Usage (PowerShell, from the project root):
+    python manage.py shell -c "exec(open('utils/db_scripts/check_pending_migration.py').read())"
+"""
+from django.db import connection
+from django.db.migrations import operations as ops
+from django.db.migrations.loader import MigrationLoader
+
+APP_LABEL = "rss"
+# None = auto-detect the latest (leaf) migration of APP_LABEL
+TARGET_MIGRATION = None
+
+STATUS_APPLIED = "ALREADY IN DB"
+STATUS_PENDING = "PENDING"
+STATUS_MANUAL = "CHECK MANUALLY"
+
+
+class SchemaInspector:
+    """Lazy, cached, read-only view of the live DB schema."""
+
+    def __init__(self):
+        with connection.cursor() as cursor:
+            self.tables = set(connection.introspection.table_names(cursor))
+        self._columns = {}
+
+    def has_table(self, table):
+        return table in self.tables
+
+    def has_column(self, table, column):
+        if not self.has_table(table):
+            return False
+        if table not in self._columns:
+            with connection.cursor() as cursor:
+                description = connection.introspection.get_table_description(cursor, table)
+            self._columns[table] = {col.name for col in description}
+        return column in self._columns[table]
+
+    @staticmethod
+    def column_type(table, column):
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT data_type, character_maximum_length FROM information_schema.columns "
+                "WHERE table_schema = current_schema() AND table_name = %s AND column_name = %s",
+                [table, column],
+            )
+            row = cursor.fetchone()
+        if row is None:
+            return None
+        data_type, max_length = row
+        return f"{data_type}({max_length})" if max_length else data_type
+
+    @staticmethod
+    def has_constraint_or_index(name):
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = %s) "
+                "OR EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = %s)",
+                [name, name],
+            )
+            return cursor.fetchone()[0]
+
+
+def resolve_target(loader):
+    if TARGET_MIGRATION:
+        return TARGET_MIGRATION
+    leaves = [name for app, name in loader.graph.leaf_nodes() if app == APP_LABEL]
+    if len(leaves) != 1:
+        raise RuntimeError(f"Expected one leaf migration for '{APP_LABEL}', found: {leaves}")
+    return leaves[0]
+
+
+def get_model_table(state, model_name):
+    model_state = state.models[(APP_LABEL, model_name.lower())]
+    return model_state.options.get("db_table") or f"{APP_LABEL}_{model_name.lower()}"
+
+
+def get_field_storage(state, model_name, field_name):
+    """Return (table, column, field); column is None for M2M fields."""
+    model_state = state.models[(APP_LABEL, model_name.lower())]
+    field = dict(model_state.fields)[field_name]
+    table = get_model_table(state, model_name)
+    if field.many_to_many:
+        return field.db_table or f"{table}_{field_name}", None, field
+    if field.many_to_one or field.one_to_one:
+        return table, field.db_column or f"{field_name}_id", field
+    return table, field.db_column or field_name, field
+
+
+def field_exists(schema, table, column):
+    return schema.has_table(table) if column is None else schema.has_column(table, column)
+
+
+def classify_operation(operation, state_before, state_after, schema):
+    """Return (status, detail) for a single migration operation."""
+    if isinstance(operation, ops.CreateModel):
+        table = get_model_table(state_after, operation.name)
+        return (STATUS_APPLIED if schema.has_table(table) else STATUS_PENDING), table
+
+    if isinstance(operation, ops.DeleteModel):
+        table = get_model_table(state_before, operation.name)
+        return (STATUS_PENDING if schema.has_table(table) else STATUS_APPLIED), table
+
+    if isinstance(operation, ops.AddField):
+        table, column, _ = get_field_storage(state_after, operation.model_name, operation.name)
+        exists = field_exists(schema, table, column)
+        return (STATUS_APPLIED if exists else STATUS_PENDING), f"{table}.{column or '(m2m)'}"
+
+    if isinstance(operation, ops.RemoveField):
+        table, column, _ = get_field_storage(state_before, operation.model_name, operation.name)
+        exists = field_exists(schema, table, column)
+        return (STATUS_PENDING if exists else STATUS_APPLIED), f"{table}.{column or '(m2m)'}"
+
+    if isinstance(operation, ops.AlterField):
+        table, column, field = get_field_storage(state_after, operation.model_name, operation.name)
+        if column is None:
+            return STATUS_MANUAL, f"{table} (m2m)"
+        if not schema.has_column(table, column):
+            return STATUS_PENDING, f"{table}.{column} missing"
+        try:
+            model_type = field.db_type(connection)
+        except Exception:
+            model_type = "?"
+        db_type = schema.column_type(table, column)
+        return STATUS_MANUAL, f"{table}.{column} db={db_type} -> model={model_type}"
+
+    if isinstance(operation, (ops.AddConstraint, ops.AddIndex)):
+        name = operation.constraint.name if isinstance(operation, ops.AddConstraint) else operation.index.name
+        exists = schema.has_constraint_or_index(name)
+        return (STATUS_APPLIED if exists else STATUS_PENDING), name
+
+    if isinstance(operation, (ops.RemoveConstraint, ops.RemoveIndex)):
+        exists = schema.has_constraint_or_index(operation.name)
+        return (STATUS_PENDING if exists else STATUS_APPLIED), operation.name
+
+    return STATUS_MANUAL, ""
+
+
+def run():
+    db_name = connection.settings_dict.get("NAME")
+    print(f"Target DB -> host: {connection.settings_dict.get('HOST')} | name: {db_name}")
+    answer = input(f"Type the database name ({db_name}) to confirm it is NOT production: ")
+    if answer.strip() != db_name:
+        print("Aborted.")
+        return
+
+    loader = MigrationLoader(connection, ignore_no_migrations=True)
+    target = resolve_target(loader)
+    # State right before the target migration (target excluded)
+    state = loader.project_state((APP_LABEL, target), at_end=False)
+    migration = loader.get_migration(APP_LABEL, target)
+    schema = SchemaInspector()
+    summary = {STATUS_APPLIED: 0, STATUS_PENDING: 0, STATUS_MANUAL: 0}
+
+    print(f"\nChecking {APP_LABEL}.{target}\n")
+    for index, operation in enumerate(migration.operations, start=1):
+        state_before = state.clone()
+        operation.state_forwards(APP_LABEL, state)
+        try:
+            status, detail = classify_operation(operation, state_before, state, schema)
+        except KeyError as error:
+            status, detail = STATUS_MANUAL, f"model/field not in state: {error}"
+        summary[status] += 1
+        suffix = f" | {detail}" if detail else ""
+        print(f"{index:>3}. [{status}] {operation.describe()}{suffix}")
+
+    print("\nSummary:", summary)
+
+
+run()
