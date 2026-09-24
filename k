@@ -1,0 +1,1 @@
+$('#main-single-search, #main-multiple-search, #main-secure-change-search, #main-whoswho-search, #main-sref-search, #main-iv2-search, #main-frida-ar-section, #main-frida-env-result-section, #main-frida-expo-layer-result-section, #main-frida-port-section, #main-frida-result-section').addClass('d-none');
