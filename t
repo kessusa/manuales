@@ -1,0 +1,199 @@
+{% load custom_filters static %}
+
+<input hidden id="filter_params" type="text" value="{{ request|request_to_filter_get }}">
+
+<div class="row mb-3">
+    <div class="col-12">
+        {% if page_obj %}
+            <div class="table-responsive">
+                <table class="table table-responsive mb-0 table-striped">
+                    <thead>
+                    <tr class="text-nowrap">
+                        <th scope="col" class="border-0">Policy name</th>
+                        <th scope="col" class="border-0">Push date</th>
+                        <th scope="col" class="border-0">Transaction ID</th>
+                        <th scope="col" class="border-0">Transaction ID Push</th>
+                        <th scope="col" class="border-0">Preview Status</th>
+                        <th scope="col" class="border-0">Push Status</th>
+                        <th scope="col" class="border-0">Log Preview</th>
+                        <th scope="col" class="border-0">Log Push</th>
+                    </tr>
+                    </thead>
+                    <tbody>
+                    {% for item in page_obj %}
+                        <tr>
+                            <td class="fw-normal">
+                                <span class="badge badge-sm badge-outline-primary">
+                                    {{ item.policy_name|default:'-' }}
+                                </span>
+                            </td>
+                            <td class="text-nowrap">
+                                <small>{{ item.updated_at|date:'d/m/Y H:i:s'|default:"-" }}</small>
+                            </td>
+                            <td class="fw-normal">
+                                <span class="badge badge-sm badge-outline-secondary">
+                                    {{ item.transaction_id|default:'-' }}
+                                </span>
+                            </td>
+                            <td class="fw-normal">
+                                <span class="badge badge-sm badge-outline-secondary">
+                                    {{ item.transaction_push_id|default:'-' }}
+                                </span>
+                            </td>
+                            <td class="fw-normal">
+                                {% if item.preview_status == 'pending' %}
+                                    <span class="badge badge-sm badge-outline-secondary">
+                                        {{ item.preview_status|capfirst }}
+                                    </span>
+                                {% elif item.preview_status == 'warning' %}
+                                    <span class="badge badge-sm badge-outline-warning">
+                                        {{ item.preview_status|capfirst }}
+                                    </span>
+                                {% elif item.preview_status == 'success' %}
+                                    <span class="badge badge-sm badge-outline-success">
+                                        {{ item.preview_status|capfirst }}
+                                    </span>
+                                {% elif item.preview_status == 'failed' %}
+                                    <span class="badge badge-sm badge-outline-danger">
+                                        {{ item.preview_status|capfirst }}
+                                    </span>
+                                {% else %}
+                                    <span class="badge badge-sm badge-outline-dark">
+                                        {{ item.preview_status|capfirst }}
+                                    </span>
+                                {% endif %}
+                            </td>
+                            <td class="fw-normal">
+                                {% if item.push_status == 'pending' %}
+                                    <span class="badge badge-sm badge-outline-secondary">
+                                        {{ item.push_status|capfirst }}
+                                    </span>
+                                {% elif item.push_status == 'warning' %}
+                                    <span class="badge badge-sm badge-outline-warning">
+                                        {{ item.push_status|capfirst }}
+                                    </span>
+                                {% elif item.push_status == 'success' %}
+                                    <span class="badge badge-sm badge-outline-success">
+                                        {{ item.push_status|capfirst }}
+                                    </span>
+                                {% elif item.push_status == 'failed' %}
+                                    <span class="badge badge-sm badge-outline-danger">
+                                        {{ item.push_status|capfirst }}
+                                    </span>
+                                {% else %}
+                                    <span class="badge badge-sm badge-outline-dark">
+                                        {{ item.push_status|capfirst }}
+                                    </span>
+                                {% endif %}
+                            </td>
+                            <td class="fw-normal text-secondary">
+                                <div class="dropdown-menu-custom js-log-expand" style="cursor: zoom-in" title="Click to expand"
+                                     data-log-title="Log Preview - {{ item.policy_name|default:'-' }}"
+                                     data-bs-toggle="modal" data-bs-target="#push_firewall_log_modal">
+                                    {% if item.preview_log %}
+                                        {% for line in item.preview_log.splitlines %}
+                                            {% if 'config' in line %}
+                                                <hr>
+                                            {% endif %}
+                                            <span class="text-xs {% if line|first in 'Status' or '%' in line or 'delete' in line or 'warn' in line or 'info' in line or 'disable' in line %}fw-bold text-primary{% endif %}">
+                                                {{ line }}
+                                            </span><br>
+                                            {% if ' end' in line %}
+                                                <hr>
+                                            {% endif %}
+                                        {% endfor %}
+                                    {% else %}
+                                        Your request is being processed..
+                                    {% endif %}
+                                </div>
+                            </td>
+                            <td class="fw-normal text-secondary">
+                                <div class="dropdown-menu-custom js-log-expand" style="cursor: zoom-in" title="Click to expand"
+                                     data-log-title="Log Push - {{ item.policy_name|default:'-' }}"
+                                     data-bs-toggle="modal" data-bs-target="#push_firewall_log_modal">
+                                    {% for data in item.push_log %}
+                                        {% for key,value in data.items %}
+                                            <span class="text-xs {% if 'failed' in value|lower or key == 'state' and value == 5 %}fw-bold text-danger{% endif %}">
+                                                {{ key }}: {{ value }}
+                                            </span>
+                                            <br>
+                                        {% endfor %}
+                                        <hr>
+                                    {% endfor %}
+                                </div>
+                            </td>
+                        </tr>
+                    {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        {% else %}
+            <div class="col-12 mt-4 text-center">
+                <span class="text-muted mb-2 text-xs text-center">No data is currently available.</span>
+            </div>
+        {% endif %}
+    </div>
+</div>
+
+<div class="modal fade" id="push_firewall_log_modal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog modal-fullscreen modal-dialog-scrollable">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title" id="push_firewall_log_modal_title"></h5>
+                <button type="button" class="btn btn-sm btn-outline-primary ms-auto me-2" id="push_firewall_log_copy">Copy</button>
+                <button type="button" class="btn-close ms-0" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body fs-6" id="push_firewall_log_modal_body"></div>
+        </div>
+    </div>
+</div>
+
+{% include 'pagination.html' %}
+
+<script type="text/javascript">
+
+    // Expand the clicked log cell into the full screen modal
+    $(document).off('click.push_firewall_log').on('click.push_firewall_log', '.js-log-expand', function () {
+        $('#push_firewall_log_modal_title').text($(this).data('log-title'));
+        $('#push_firewall_log_modal_body').html($(this).html());
+    });
+
+    // Copy the expanded log as plain text, with its title on the first line
+    $(document).off('click.push_firewall_log_copy').on('click.push_firewall_log_copy', '#push_firewall_log_copy', function () {
+        var $_button = $(this);
+        var $_text = $('#push_firewall_log_modal_title').text() + '\n\n' +
+            document.getElementById('push_firewall_log_modal_body').innerText;
+        var $_textarea = $('<textarea>').val($_text).appendTo('#push_firewall_log_modal .modal-content');
+        $_textarea.select();
+        document.execCommand('copy');
+        $_textarea.remove();
+        $_button.text('Copied');
+        setTimeout(function () {
+            $_button.text('Copy');
+        }, 1500);
+    });
+
+    var $_filter_params = $('#filter_params').val();
+
+    if ($_filter_params && $_filter_params !== '{}') {
+        $_data = JSON.parse($_filter_params);
+
+        var $_row = ''
+        $.each($_data, function (key, value) {
+            $_row += '<div class="row bg-light bg-gradient">' +
+                '    <div class="col-12">' +
+                '        <small class="text-secondary text-capitalize fw-bold">* '
+                + key.replaceAll('_', ' ') +
+                ': </small>' +
+                '        <small class="fst-italic text-capitalize">' + value + '</small>' +
+                '    </div>' +
+                '</div>';
+        });
+        document.getElementById('filter-box').innerHTML = '<div class="row bg-light bg-gradient">' +
+            '<div class="col-12 py-2">' +
+            '    <small class="text-primary fw-bold"> ** Applied filters </small>' +
+            '</div>' +
+            '</div>' +
+            $_row;
+    }
+</script>
