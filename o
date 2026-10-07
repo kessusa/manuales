@@ -1,0 +1,596 @@
+# Push Firewall Check Point: preview y push automáticos
+
+Guía de los dos management commands que automatizan la instalación de políticas Check Point en ProdSecHub:
+
+| Comando | Qué hace | Cuándo corre |
+|---|---|---|
+| `push_firewall_preview_checkpoint` | Verifica la política y guarda qué cambios se van a instalar. No instala nada. | Una hora antes de la hora programada |
+| `push_firewall_checkpoint` | Instala las políticas cuyo preview lo permite. | A la hora programada |
+
+Los dos se lanzan sin argumentos y cada hora. Ellos deciden si hay algo que hacer.
+
+> **Alcance de esta guía.** Los formatos de los comandos están tomados del código. Los ejemplos de respuestas de Check Point están reconstruidos a partir de las salidas reales vistas en STG; los campos que el código no usa pueden variar y están marcados como ilustrativos.
+
+---
+
+## 1. Visión general
+
+```
+14:30  preview  ->  busca políticas programadas a las 15:00
+                    show-changes (1 vez por dominio) + verify-policy (1 vez por política)
+                    crea una fila en push_firewall_log con preview_status
+
+15:00  push     ->  busca las filas de hoy de las políticas programadas a las 15:00
+                    si el último preview lo permite: install-policy
+                    actualiza esa misma fila con push_status y push_log
+```
+
+La fila de `push_firewall_log` es el enlace entre los dos comandos: el preview la crea y el push la completa.
+
+Las horas son siempre hora de **París**.
+
+---
+
+## 2. Condiciones de entrada
+
+Tabla `push_firewall` (modelo `PushFirewall`). Una política entra si cumple **todo**:
+
+| Campo | Preview | Push |
+|---|---|---|
+| `scheduled_time` | contiene la hora **siguiente** (`'15:00'`) | contiene la hora **actual** (`'15:00'`) |
+| `business_day` | contiene el día de hoy (`'wednesday'`) | no se comprueba (basta el log de hoy) |
+| `auto` | `True` | `True` |
+| `freeze` | `False` | `False` |
+| `ticket` | no nulo | no nulo |
+| `policy.technology` | `'CHECKPOINT'` | `'CHECKPOINT'` |
+
+El push exige además, sobre `push_firewall_log`:
+
+- un log con `updated_at` de hoy,
+- que el **último** log de hoy de esa política tenga `preview_status` en `('success', 'warning')`,
+- y `push_status = 'not started yet'`.
+
+Ejemplo de política que entra:
+
+```
+tag_name:        EMEA_UK_STG_DMZI_APPL_MKT-ETS
+domain:          ETS-UK
+technology:      CHECKPOINT
+scheduled_time:  ["15:00"]
+business_day:    ["monday", "tuesday", "wednesday", "thursday", "friday"]
+auto:            true
+freeze:          false
+ticket:          (cualquier valor no nulo)
+```
+
+Para parar una política a mano: `freeze = True` o `auto = False`.
+
+---
+
+## 3. Comando de preview
+
+Fichero: `rss/management/commands/push_firewall_preview_checkpoint.py`
+
+### 3.1 Constantes
+
+```python
+DEFAULT_LOOKBACK_DAYS = 3
+
+TASK_STATUS_MAPPING = {
+    'succeeded': 'success',
+    'succeeded with warnings': 'warning',
+    'partially succeeded': 'warning',
+    'failed': 'failed',
+}
+```
+
+- `DEFAULT_LOOKBACK_DAYS`: días hacia atrás que se piden si una política nunca se ha instalado.
+- `TASK_STATUS_MAPPING`: estado del `verify-policy` de Check Point -> estado del preview. Un estado que no esté en la tabla (por ejemplo `in progress`) se convierte en `pending`.
+
+### 3.2 Paso a paso del `handle`
+
+**Paso 1. Registrar la tarea**
+
+Crea una fila en `task_date` (`TaskUpdateDate`) con `name='push_firewall_preview_checkpoint'`.
+
+**Paso 2. Calcular la hora**
+
+```python
+hour_preview = (datetime.now(pytz.timezone('Europe/Paris')) + timedelta(hours=1)).hour
+```
+
+| Entrada | Salida |
+|---|---|
+| Son las 14:30 en París | `15` -> se buscará `'15:00'` |
+
+**Paso 3. Buscar las políticas**
+
+Consulta `PushFirewall` con las condiciones de la sección 2.
+
+**Paso 4. Agrupar por dominio**
+
+```python
+policies[push_firewall.policy.domain].setdefault(push_firewall.policy.tag_name, push_firewall)
+```
+
+Salida:
+
+```python
+{
+    'ETS-UK': {
+        'EMEA_UK_STG_DMZI_APPL_MKT-ETS': <PushFirewall id=37>,
+    },
+}
+```
+
+Se agrupa porque los cambios pendientes se piden a Check Point una vez por dominio.
+
+**Paso 5. Última instalación de cada política**
+
+```python
+last_installs = {37: datetime(2026, 10, 6, 14, 15, 16)}
+```
+
+Clave: id del `PushFirewall`. Valor: `updated_at` más reciente de sus logs con `push_status='success'`. Una política que nunca se ha instalado no aparece.
+
+**Paso 6. Guardar la lista y recorrer los dominios**
+
+Guarda en la tarea `{'policies': [...], 'errors': []}` y llama a `preview_domain` por cada dominio. Si un dominio lanza una excepción, se anota en `errors` y se sigue con el siguiente.
+
+**Paso 7. Cerrar la tarea**
+
+Guarda `finish_at`.
+
+### 3.3 `preview_domain(domain, policies, last_installs, connector=CheckPoint)`
+
+| | |
+|---|---|
+| **Entrada** | `domain='ETS-UK'`, el diccionario de políticas de ese dominio, `last_installs` |
+| **Salida** | lista de errores, por ejemplo `[]` o `['ETS-UK/POLICY_A: preview failed']` |
+| **Efecto** | crea una fila en `push_firewall_log` por política |
+
+El parámetro `connector` vale `CheckPoint` por defecto; solo se cambia en los tests para no conectarse al MDS. Se crea un conector nuevo en cada llamada porque el `logout` deja la instancia inservible.
+
+Orden interno:
+
+1. `get_domain_from_date` -> fecha desde la que pedir cambios.
+2. `get_pending_changes` -> cambios del dominio (una vez).
+3. Por cada política: `verify_policy_package`, filtros, estado, log y `PushFirewallLog.objects.create`.
+
+### 3.4 Funciones de apoyo
+
+#### `get_domain_from_date(policies, last_installs)`
+
+Día desde el que pedir cambios para todo el dominio.
+
+| Entrada | Salida |
+|---|---|
+| Todas las políticas tienen instalación; la más antigua es 2026-10-06 14:15 | `'2026-10-06'` |
+| Alguna política no tiene instalación; hoy es 2026-10-07 | `'2026-10-04'` (hoy menos 3 días) |
+
+Formato de salida: texto `YYYY-MM-DD`.
+
+#### `get_pending_changes(url, domain, from_date=...)` (conector)
+
+Llama al `show-changes` de Check Point. Devuelve la lista de cambios publicados en el dominio desde esa fecha.
+
+Campos que usa el comando:
+
+```python
+[
+    {
+        'operation': 'added',                                   # 'deleted' para un borrado
+        'policy_packages': ['EMEA_UK_STG_DMZI_APPL_MKT-ETS'],   # vacío en objetos compartidos
+        'sessions': [{'publish_time': '2026-10-07T09:36+0000'}],
+        # ... resto de campos (tipo, nombre, uid...): los usa format_pending_changes
+    },
+]
+```
+
+Los nombres del resto de campos son ilustrativos: dependen del conector.
+
+#### `verify_policy_package(url, domain, policy_name)` (conector)
+
+Hace login en el dominio, lanza `verify-policy`, espera el resultado y hace logout.
+
+```python
+{
+    'task_id': '01234567-89ab-cdef-a45b-2b12285ecd68',
+    'status': 'succeeded',
+    'progress': 100,
+    'details': [],          # puede traer 'errors' y 'warnings'
+}
+```
+
+#### `filter_changes_by_package(changes, policy_name)`
+
+Se queda con los cambios de esa política y con los que no tienen paquete.
+
+Entrada (`policy_name='POLICY_A'`):
+
+```python
+[
+    {'uid': 'a', 'policy_packages': ['POLICY_A']},
+    {'uid': 'b', 'policy_packages': [{'name': 'POLICY_B'}]},
+    {'uid': 'c', 'policy_packages': []},
+]
+```
+
+Salida: los cambios `a` y `c`. Si `changes` es `None`, devuelve `None`.
+
+#### `filter_changes_after_install(changes, last_install)`
+
+Descarta lo publicado antes de la última instalación de esa política.
+
+Entrada (`last_install` = 2026-10-06 14:15):
+
+```python
+[
+    {'uid': 'old', 'sessions': [{'publish_time': '2026-10-06T08:51+0000'}]},
+    {'uid': 'new', 'sessions': [{'publish_time': '2026-10-07T09:36+0000'}]},
+    {'uid': 'no_date', 'sessions': [{'publish_time': None}]},
+]
+```
+
+Salida: `new` y `no_date`. Un cambio sin fecha se mantiene, para no esconder nada. Si la política nunca se instaló (`last_install` es `None`), no filtra.
+
+#### `has_delete_action(changes)`
+
+| Entrada | Salida |
+|---|---|
+| `[{'operation': 'added'}, {'operation': 'deleted'}]` | `True` |
+| `[{'operation': 'added'}]` o `[]` | `False` |
+
+#### `get_preview_status(verify_result, changes)`
+
+Devuelve la pareja `(preview_status, internal_note)`.
+
+| Estado del verify | Cambios | Salida |
+|---|---|---|
+| sin estado | cualquiera | `('failed', None)` |
+| `failed` | cualquiera | `('failed', None)` |
+| `succeeded` | `None` (no se pudieron leer) | `('pending', 'ignored due show-changes not available')` |
+| `succeeded` | con un borrado | `('pending', 'ignored due a delete action')` |
+| `succeeded` | sin borrados | `('success', None)` |
+| `succeeded with warnings` | sin borrados | `('warning', None)` |
+| `in progress` (tiempo agotado) | sin borrados | `('pending', None)` |
+
+#### `build_preview_log(verify_result, changes, format_changes)`
+
+Monta el texto de la columna **Log Preview**. Usa `format_pending_changes` del conector para la lista de cambios.
+
+Salida con cambios:
+
+```
+=== Preview result ===
+
+The following changes will be installed on the next policy push:
+
+[NEW] host 'EXT_003.081.232.007' (3.81.232.7)
+Published by secprod on 2026-10-05T09:36+0000 - "PlayFlows - Transaction id 261005113527065005"
+```
+
+Salida sin cambios:
+
+```
+=== Preview result ===
+
+No pending changes to install.
+```
+
+Si no se pudieron leer los cambios, la última línea es `show-changes not available`. Si el verify trae avisos o errores, aparecen como `warning: ...` o `error: ...` antes de la lista.
+
+### 3.5 Lo que deja escrito el preview
+
+Fila nueva en `push_firewall_log`:
+
+| Columna | Ejemplo |
+|---|---|
+| `policy_log_id` | `37` |
+| `transaction_id` | `01234567-89ab-cdef-a45b-2b12285ecd68` (id del verify) |
+| `preview_status` | `success` |
+| `preview_log` | el texto de la sección anterior |
+| `internal_note` | vacío, o el motivo del `pending` |
+| `push_status` | `not started yet` |
+
+Fila en `task_date`, columna `message`:
+
+```json
+{"policies": [["EMEA_UK_STG_DMZI_APPL_MKT-ETS", "ETS-UK"]], "errors": []}
+```
+
+---
+
+## 4. Comando de push
+
+Fichero: `rss/management/commands/push_firewall_checkpoint.py`
+
+### 4.1 Constantes
+
+```python
+SUCCESS_STATUSES = ('succeeded', 'succeeded with warnings')
+PUSH_PREVIEW_STATUSES = ('success', 'warning')
+```
+
+- `SUCCESS_STATUSES`: estados del `install-policy` que cuentan como instalación correcta.
+- `PUSH_PREVIEW_STATUSES`: estados del preview que permiten instalar.
+
+### 4.2 Paso a paso del `handle`
+
+**Paso 1.** Crea la fila en `task_date` con `name='push_firewall_checkpoint'`.
+
+**Paso 2.** Calcula la hora actual de París (sin sumar nada): a las 15:00 busca `'15:00'`.
+
+**Paso 3.** Consulta los `PushFirewallLog` de hoy de las políticas que cumplen las condiciones de la sección 2, ordenados por `id`.
+
+**Paso 4.** `get_push_policies` decide cuáles se instalan.
+
+**Paso 5.** Guarda la lista en la tarea y llama a `push_policy` por cada una.
+
+**Paso 6.** Guarda `finish_at` y los errores.
+
+### 4.3 `get_push_policies(log_rows)`
+
+Se queda con el último log de cada política y comprueba que permite instalar.
+
+Entrada, una tupla por log `(log_id, push_firewall_id, policy_name, domain, preview_status, push_status)`:
+
+```python
+[
+    (41, 37, 'POLICY_A', 'ETS-UK', 'success', 'not started yet'),
+    (42, 37, 'POLICY_A', 'ETS-UK', 'pending', 'not started yet'),
+    (43, 38, 'POLICY_B', 'ETS-UK', 'failed',  'not started yet'),
+    (44, 38, 'POLICY_B', 'ETS-UK', 'success', 'not started yet'),
+]
+```
+
+Salida:
+
+```python
+[['POLICY_B', 'ETS-UK', 44]]
+```
+
+`POLICY_A` no entra: su último preview (log 42) está en `pending`, aunque el anterior fuera `success`.
+
+### 4.4 `push_policy(policy_name, domain, log_id, connector=CheckPoint)`
+
+| | |
+|---|---|
+| **Entrada** | `'EMEA_UK_STG_DMZI_APPL_MKT-ETS'`, `'ETS-UK'`, `44` |
+| **Salida** | `None` si fue bien, o el texto del error: `'ETS-UK/EMEA_UK_STG_DMZI_APPL_MKT-ETS: push failed'` |
+| **Efecto** | instala la política y actualiza la fila `44` del log |
+
+Orden interno:
+
+1. Crea el conector.
+2. Llama a `install_policy_package`.
+3. `build_push_log` -> log.
+4. `get_push_status` -> estado.
+5. Actualiza la fila del log.
+6. Devuelve el error, si lo hubo.
+
+Los pasos 1 a 3 van en un `try`: si el conector lanza una excepción (login, red), esa política se guarda como `failed` y el bucle sigue con las demás.
+
+### 4.5 Funciones de apoyo
+
+#### `install_policy_package(url, domain, policy_name)` (conector)
+
+Hace login, lanza `install-policy`, espera hasta 600 segundos y hace logout.
+
+Salida correcta:
+
+```python
+{
+    'task_id': 'b9b8752d-ded3-4126-97a1-e5da714bd794',
+    'status': 'succeeded',
+    'progress': 100,
+    'details': [{
+        'gatewayName': 'gbh10-eta-spfw-cp02',
+        'statusDescription': 'Succeeded',
+        'stagesInfo': [{'type': 'info', 'stage': 'modern verification', 'messages': []}],
+    }],
+}
+```
+
+Salida con fallo:
+
+```python
+{
+    'task_id': '623e1eb0-ed1e-4951-bc99-9c133d3ad971',
+    'status': 'failed',
+    'progress': 100,
+    'details': [{
+        'gatewayName': 'gbh10-eta-spfw-cp02',
+        'statusCode': 'failed',
+        'statusDescription': 'Failed',
+        'stagesInfo': [{
+            'type': 'err',
+            'stage': 'modern verification',
+            'messages': [{
+                'type': 'err',
+                'message': "Layer 'EMEA_UK_STG_DMZI_APPL_MKT-ETS Security': Rule 28 Conflicts with Rule 56 for Services & Applications: TCP_445 .\n",
+            }],
+        }],
+    }],
+}
+```
+
+#### `get_push_status(install_result)`
+
+| Estado de Check Point | Salida |
+|---|---|
+| `succeeded` | `'success'` |
+| `succeeded with warnings` | `'success'` |
+| `failed`, `partially succeeded`, `in progress`, sin respuesta | `'failed'` |
+
+#### `build_push_log(install_result)`
+
+Monta la columna **Log Push** con la misma forma que el log de Fortinet: una lista de diccionarios que la plantilla pinta como líneas `clave: valor`.
+
+Instalación correcta, salida:
+
+```python
+[{'gateway': 'gbh10-eta-spfw-cp02 (Succeeded)'}]
+```
+
+En pantalla:
+
+```
+gateway: gbh10-eta-spfw-cp02 (Succeeded)
+```
+
+Instalación fallida, salida:
+
+```python
+[
+    {'status': 'failed', 'progress': 100},
+    {
+        'gateway': 'gbh10-eta-spfw-cp02 (Failed)',
+        'err (modern verification)': "Layer 'EMEA_UK_STG_DMZI_APPL_MKT-ETS Security': Rule 28 Conflicts with Rule 56 for Services & Applications: TCP_445 .",
+    },
+]
+```
+
+En pantalla:
+
+```
+status: failed
+progress: 100
+---------
+gateway: gbh10-eta-spfw-cp02 (Failed)
+err (modern verification): Layer '...' : Rule 28 Conflicts with Rule 56 ...
+```
+
+Reglas del formato:
+
+- El bloque `status` / `progress` de la tarea solo aparece si la instalación no fue correcta o si no hay detalle de gateways (el estado ya está en la columna Push Status).
+- Un bloque por gateway.
+- Una clave por tipo de mensaje y etapa; varios mensajes iguales se unen con ` | `.
+- Sin respuesta de Check Point: `[{'status': 'failed (no task returned)'}]`.
+- Excepción del conector: `[{'status': 'failed', 'error': 'install-policy failed (...)'}]`.
+
+### 4.6 Lo que deja escrito el push
+
+Actualiza la fila que creó el preview:
+
+| Columna | Ejemplo |
+|---|---|
+| `transaction_push_id` | `b9b8752d-ded3-4126-97a1-e5da714bd794` (id de la instalación) |
+| `push_status` | `success` |
+| `push_log` | la lista de la sección anterior |
+| `updated_at` | fecha y hora del push |
+
+`updated_at` es la fecha que el siguiente preview usa como "última instalación".
+
+Fila en `task_date`, columna `message`:
+
+```json
+{"policies": [["EMEA_UK_STG_DMZI_APPL_MKT-ETS", "ETS-UK", 44]], "errors": []}
+```
+
+El comando no modifica el ticket de la política.
+
+---
+
+## 5. Ejemplo completo
+
+Política `EMEA_UK_STG_DMZI_APPL_MKT-ETS`, dominio `ETS-UK`, programada a las `15:00`, miércoles 7 de octubre. Última instalación: 6 de octubre a las 14:15. Se ha publicado un host nuevo el día 7 a las 11:36 (hora de París).
+
+**14:30, preview**
+
+1. Hora de París más una: busca `'15:00'` -> encuentra la política.
+2. `last_installs = {37: 2026-10-06 14:15:16}`.
+3. `from_date = '2026-10-06'`.
+4. `show-changes` del dominio `ETS-UK` -> devuelve el host nuevo y cambios del día 6 por la mañana.
+5. `verify-policy` -> `succeeded`.
+6. Filtro por paquete: se mantiene el host (objeto sin paquete).
+7. Filtro por fecha: se descartan los cambios anteriores a las 14:15 del día 6.
+8. Estado: `('success', None)`.
+9. Crea el log 44 con `preview_status='success'` y `push_status='not started yet'`.
+
+**15:00, push**
+
+1. Hora de París: busca `'15:00'` -> encuentra el log 44.
+2. `get_push_policies` -> `[['EMEA_UK_STG_DMZI_APPL_MKT-ETS', 'ETS-UK', 44]]`.
+3. `install-policy` -> `succeeded` en `gbh10-eta-spfw-cp02`.
+4. Actualiza el log 44: `push_status='success'`, `push_log=[{'gateway': 'gbh10-eta-spfw-cp02 (Succeeded)'}]`.
+
+**Variante: el cambio publicado es un borrado**
+
+- El preview deja el log en `pending` con la nota `ignored due a delete action`.
+- A las 15:00 el push no encuentra ninguna política que instalar. Alguien tiene que revisarla e instalarla a mano.
+
+---
+
+## 6. Cómo lanzarlos
+
+A mano, desde la raíz del proyecto:
+
+```
+venv\Scripts\python.exe manage.py push_firewall_preview_checkpoint
+venv\Scripts\python.exe manage.py push_firewall_checkpoint
+```
+
+Con el Programador de tareas de Windows, una tarea por comando:
+
+| Campo | Valor |
+|---|---|
+| Program/script | `<proyecto>\venv\Scripts\python.exe` |
+| Add arguments | `manage.py push_firewall_preview_checkpoint` (o `manage.py push_firewall_checkpoint`) |
+| Start in | `<proyecto>` |
+| Trigger | repetir cada 1 hora; el preview a y media, el push en punto |
+
+La máquina necesita la variable `NO_PROXY` con el host del MDS para llegar a Check Point.
+
+No lances el push a mano para probar: si una política coincide con la hora y tiene el preview válido, la instala de verdad.
+
+---
+
+## 7. Cómo comprobar el resultado
+
+Últimos logs:
+
+```sql
+SELECT id, policy_log_id, transaction_id, preview_status, internal_note,
+       push_status, transaction_push_id, updated_at
+FROM push_firewall_log
+ORDER BY id DESC
+LIMIT 5;
+```
+
+Qué hizo cada ejecución y con qué errores:
+
+```sql
+SELECT name, created_at, finish_at, message
+FROM task_date
+WHERE name IN ('push_firewall_preview_checkpoint', 'push_firewall_checkpoint')
+ORDER BY id DESC
+LIMIT 4;
+```
+
+Políticas que entrarían en automático:
+
+```sql
+SELECT id, scheduled_time, business_day, auto, freeze, ticket
+FROM push_firewall
+WHERE auto = true AND freeze = false;
+```
+
+En la interfaz: **Firewall > Push Firewall > Push Firewall Logs**. Al pinchar en Log Preview o Log Push se abre el log completo con un botón para copiarlo.
+
+Tests:
+
+```
+python manage.py test rss.test_push_firewall_checkpoint rss.test_push_firewall_preview_checkpoint
+```
+
+---
+
+## 8. Puntos abiertos
+
+1. **Zona horaria de la última instalación.** `filter_changes_after_install` convierte la fecha con `timezone.make_aware`. Falta confirmar `USE_TZ` y `TIME_ZONE` en `settings.py`: según su valor, el preview podría dar por instalados cambios recientes.
+2. **Cambios que se anulan en el mismo día.** Los cambios se piden por día, no por hora. Una regla creada, instalada y borrada el mismo día no aparece en el preview, aunque el siguiente push sí la quite del gateway.
+3. **`partially succeeded` se trata como `warning`** en el preview, y por tanto se instala. Si no debe instalarse, cambiarlo a `pending` en `TASK_STATUS_MAPPING`.
+4. **Tiempo agotado en la instalación.** Si supera los 600 segundos, el push se guarda como `failed` aunque Check Point pueda seguir instalando.
+5. **Reglas de `pending` más finas.** Hoy cualquier borrado para la instalación. Está propuesta, sin implementar, una tabla de reglas para decidir qué borrados paran y cuáles solo se anotan.
+6. **El push solo mira logs de hoy.** Una política programada a las `00:00` no se instalaría, porque su preview corre a las 23:00 del día anterior.
