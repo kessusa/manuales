@@ -1,1 +1,0 @@
-python.exe manage.py shell -c "from django.db import connections; from APP.models import Workload; db=Workload.objects.db; c=connections[db].cursor(); print(db, [k for k,v in connections[db].introspection.get_constraints(c,'workload').items() if v['primary_key']])"
