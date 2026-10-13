@@ -1,0 +1,24 @@
+<script>
+    function copyToClipboard() {
+        const content = document.getElementById('content-to-copy');
+        if (!content) {
+            return;
+        }
+        const text = content.innerText.replace(/[ \t]+\n/g, '\n').trim();
+
+        if (navigator.clipboard && window.isSecureContext) {
+            navigator.clipboard.writeText(text);
+            return;
+        }
+        // Fallback for non-HTTPS environments
+        const textarea = document.createElement('textarea');
+        textarea.value = text;
+        textarea.setAttribute('readonly', '');
+        textarea.style.position = 'absolute';
+        textarea.style.left = '-9999px';
+        document.body.appendChild(textarea);
+        textarea.select();
+        document.execCommand('copy');
+        document.body.removeChild(textarea);
+    }
+</script>
