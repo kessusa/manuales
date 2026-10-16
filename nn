@@ -1,0 +1,40 @@
+{% if mode == 'text' %}
+    {# Plain-text tree for the copy button: one .tree-line per group or IP #}
+    <div class="tree-line">{{ line_prefix }}{{ node.group_name }}</div>
+    {% for ip in node.ips %}
+        <div class="tree-line">{{ child_prefix }}{% if forloop.last and not node.subgroups %}└── {% else %}├── {% endif %}{{ ip }}</div>
+    {% endfor %}
+    {% for child in node.subgroups %}
+        {% if forloop.last %}
+            {% with next_line_prefix=child_prefix|add:'└── ' next_child_prefix=child_prefix|add:'    ' %}
+                {% include 'search_components/group_lookup_node.html' with node=child line_prefix=next_line_prefix child_prefix=next_child_prefix mode='text' %}
+            {% endwith %}
+        {% else %}
+            {% with next_line_prefix=child_prefix|add:'├── ' next_child_prefix=child_prefix|add:'│   ' %}
+                {% include 'search_components/group_lookup_node.html' with node=child line_prefix=next_line_prefix child_prefix=next_child_prefix mode='text' %}
+            {% endwith %}
+        {% endif %}
+    {% endfor %}
+{% else %}
+    <tr class="group-lookup-row" data-depth="{{ depth }}" data-name="{{ node.group_name }}">
+        <td class="text-nowrap" style="padding-left: calc(0.75rem + {% widthratio depth 1 24 %}px);">
+            {% if depth %}<span class="text-muted mr-1 me-1">&#9492;</span>{% endif %}
+            <span class="font-weight-bold fw-bold{% if depth == 0 %} text-primary{% endif %}">{{ node.group_name }}</span>
+        </td>
+        <td class="text-nowrap text-muted">{{ parent_name|default:'-' }}</td>
+        <td class="text-center">{{ depth }}</td>
+        <td>
+            {% for ip in node.ips %}
+                <span class="badge badge-light bg-light text-dark border font-weight-normal fw-normal mr-1 me-1 mb-1">{{ ip }}</span>
+            {% empty %}
+                <span class="text-muted small font-italic fst-italic">Subgroups only</span>
+            {% endfor %}
+        </td>
+        <td class="text-center">{{ node.ips|length }}</td>
+    </tr>
+    {% for child in node.subgroups %}
+        {% with child_depth=depth|add:1 %}
+            {% include 'search_components/group_lookup_node.html' with node=child depth=child_depth parent_name=node.group_name mode='row' %}
+        {% endwith %}
+    {% endfor %}
+{% endif %}
