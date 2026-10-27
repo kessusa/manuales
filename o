@@ -1,0 +1,16 @@
+elif model_name == 'EXPORT_GROUP_COMPARATOR':
+    group_name = request.GET.get('group_name', '').strip()
+    reference_tag = request.GET.get('tag_name', '').strip()
+    filename = f'Group Comparator [{group_name}].csv'
+
+    group_maps_by_tag = load_group_maps_by_tag(group_name) if group_name and reference_tag else {}
+    firewalls = []
+    if reference_tag in group_maps_by_tag:
+        firewalls = compare_group_across_firewalls(group_name, reference_tag, group_maps_by_tag)
+
+    def stream_csv():
+        pseudo_buffer = Echo()
+        writer = csv.writer(pseudo_buffer)
+        yield writer.writerow(GROUP_COMPARATOR_CSV_HEADER)
+        for row in build_group_comparator_csv_rows(firewalls):
+            yield writer.writerow(row)
