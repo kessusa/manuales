@@ -1,0 +1,18 @@
+def has_app_label(f_labels):
+    """Return True when the microseg labels already include an APP label."""
+    return any(label and label.get('type') == 'APP' for label in f_labels or [])
+
+
+def get_application_info(ip_address, f_labels, obj_servicenow, token_servicenow, snow_cache):
+    """Resolve application data from DPR, falling back to ServiceNow for the name of single hosts."""
+    application = get_dpr_application_info(ip_address, f_labels)
+    host_ip = ip_address.replace('/32', '')
+
+    if application.get('dpr_application_name') or has_app_label(f_labels) or '/' in host_ip:
+        return application
+
+    if host_ip not in snow_cache:
+        snow_cache[host_ip] = obj_servicenow.get_ip_address_application_name(token_servicenow, host_ip)
+    if snow_cache[host_ip]:
+        application['dpr_application_name'] = snow_cache[host_ip]
+    return application
