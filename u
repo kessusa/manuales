@@ -1,0 +1,67 @@
+def build_access_request_ports(sn_ticket_id):
+    """Return every AR service of a ticket, enriched with its matching matrix ports."""
+    access_requests = (
+        AccessRequest.objects
+        .filter(task__sn_ticket_id=sn_ticket_id)
+        .order_by('ar_number')
+        .values_list('ar_number', 'services')
+    )
+    ar_services = [
+        {'ar_number': ar_number, 'ar_protocol': protocol, 'ar_port_number': port_number}
+        for ar_number, services in access_requests
+        for protocol, port_number in parse_services(services)
+    ]
+    ports_by_service = get_matrix_ports_by_service(ar_services)
+
+    rows = []
+    for ar_service in ar_services:
+        matching_ports = ports_by_service.get(get_service_key(ar_service)) or [None]
+        rows.extend({**ar_service, 'matrix_port': matrix_port} for matrix_port in matching_ports)
+    return rows
+
+
+def get_service_key(ar_service):
+    """Return the (protocol, port) key of an AR service, or None if the port is not numeric."""
+    port_number = ar_service['ar_port_number']
+    if not port_number.isdigit():
+        return None
+    return ar_service['ar_protocol'].upper(), int(port_number)
+
+
+def get_matrix_ports_by_service(ar_services):
+    """Map each AR service key to the matrix ports covering it, in a single query."""
+    service_keys = sorted({
+        service_key for service_key in map(get_service_key, ar_services) if service_key
+    })
+    if not service_keys:
+        return {}
+
+    match_annotations = {
+        f'matches_service_{index}': Case(
+            When(
+                Q(protocol__iexact=protocol, port_start__lte=port_number, port_end__gte=port_number),
+                then=Value(True),
+            ),
+            default=Value(False),
+            output_field=BooleanField(),
+        )
+        for index, (protocol, port_number) in enumerate(service_keys)
+    }
+    matrix_ports = (
+        Port.objects
+        .annotate(
+            port_start=Cast(Func(F('port_number'), Value('-'), Value(1),
+                                 function='SPLIT_PART', output_field=CharField()), IntegerField()),
+            port_end=Cast(Func(F('port_number'), Value('-'), Value(-1),
+                               function='SPLIT_PART', output_field=CharField()), IntegerField()),
+        )
+        .annotate(**match_annotations)
+        .filter(reduce(or_, (Q(**{annotation_name: True}) for annotation_name in match_annotations)))
+    )
+
+    ports_by_service = defaultdict(list)
+    for matrix_port in matrix_ports:
+        for index, service_key in enumerate(service_keys):
+            if getattr(matrix_port, f'matches_service_{index}'):
+                ports_by_service[service_key].append(matrix_port)
+    return ports_by_service
