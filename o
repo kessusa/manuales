@@ -1,0 +1,6 @@
+SELECT t.sn_ticket_id, COUNT(*) AS total_ars
+FROM serenity_stg_api_admin.access_request ar
+JOIN serenity_stg_api_admin.task t ON t.id = ar.task_id
+GROUP BY t.sn_ticket_id
+HAVING COUNT(*) > 10
+ORDER BY total_ars DESC;
