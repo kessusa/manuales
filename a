@@ -1,0 +1,92 @@
+# =====================================================================
+# EMEAPLAYFLOWS-3876 - API_cnx/iv2.py
+# Additions only. Existing methods are left untouched.
+# =====================================================================
+
+# --- 1) Add to the imports at the top of iv2.py --------------------------
+import ipaddress
+import socket
+from concurrent.futures import ThreadPoolExecutor
+
+
+# --- 2) Module level, next to get_ip_list() / ENV_LABELS -----------------
+IPLIST_MAX_EXPANDED_IPS = 256
+DNS_LOOKUP_WORKERS = 16
+
+
+def expand_ip_range(ip_begin, ip_end=None, limit=IPLIST_MAX_EXPANDED_IPS):
+    """Return the IPs between ip_begin and ip_end. Ranges bigger than limit are kept as 'begin-end'."""
+    if not ip_end or ip_end == ip_begin:
+        return [ip_begin]
+
+    try:
+        start = int(ipaddress.ip_address(ip_begin))
+        end = int(ipaddress.ip_address(ip_end))
+    except ValueError:
+        return [f'{ip_begin}-{ip_end}']
+
+    if end < start or end - start + 1 > limit:
+        return [f'{ip_begin}-{ip_end}']
+
+    return [str(ipaddress.ip_address(ip)) for ip in range(start, end + 1)]
+
+
+def resolve_dns_name(ip_address):
+    try:
+        return socket.gethostbyaddr(ip_address)[0]
+    except (OSError, ValueError):
+        return None
+
+
+def resolve_dns_names(ip_addresses):
+    """Reverse DNS lookups in parallel; returns {ip_address: dns_name}."""
+    if not ip_addresses:
+        return {}
+
+    with ThreadPoolExecutor(max_workers=DNS_LOOKUP_WORKERS) as executor:
+        return dict(zip(ip_addresses, executor.map(resolve_dns_name, ip_addresses)))
+
+
+# --- 3) New method inside class IV2Api, right after get_marketplace_iplist()
+    def get_iplist_data(self, iplist_name):
+        iplists = self.get_marketplace_iplist()
+        if not iplists:
+            return None
+
+        iplist = next(
+            (x for x in iplists if (x.get('name') or '').lower() == iplist_name.lower()),
+            None
+        )
+        if not iplist:
+            return None
+
+        ip_addresses = []
+        for ip_addr in iplist.get('ipToIplist') or []:
+            remaining = IPLIST_MAX_EXPANDED_IPS - len(ip_addresses)
+            for ip in expand_ip_range(ip_addr.get('ipBegin'), ip_addr.get('ipEnd'), limit=remaining):
+                ip_addresses.append({
+                    'ip_address': ip,
+                    'comment': ip_addr.get('comment'),
+                    'status': ip_addr.get('status'),
+                    'start_date': ip_addr.get('dateStart'),
+                })
+
+        dns_names = resolve_dns_names([x['ip_address'] for x in ip_addresses if '-' not in x['ip_address']])
+        for ip_addr in ip_addresses:
+            ip_addr['dns_name'] = dns_names.get(ip_addr['ip_address'])
+
+        try:
+            last_update = datetime.fromisoformat(iplist['lastUpdate']) if iplist.get('lastUpdate') else None
+        except ValueError:
+            last_update = None
+
+        return {
+            'iplist_identifier': iplist.get('id'),
+            'name': iplist.get('name'),
+            'ecosystem': iplist.get('ecosystem'),
+            'infra': iplist.get('infra'),
+            'status': iplist.get('status'),
+            'owner': get_fullname_from_uid(iplist['userId']) if iplist.get('userId') else None,
+            'last_update': last_update,
+            'ip_addresses': ip_addresses,
+        }
