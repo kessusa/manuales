@@ -1,0 +1,337 @@
+# EMEAPLAYFLOWS-3811: Group Comparator Update (preparación de la reunión)
+
+Oumaima pidió preparar cuatro preguntas:
+
+1. **What you did?** (input, logic and output)
+2. **Permission?** Who can access this part?
+3. **Complexity of your code?**
+4. **What's the limit of the query search?**
+
+Cada pregunta tiene:
+- **🗣️ Respuesta corta**: en inglés, lista para decirla en la reunión.
+- **Detalle**: en español, para responder las repreguntas.
+
+Al final hay una sección de **preguntas trampa** y un **checklist** de lo que conviene verificar antes de entrar.
+
+---
+
+## 0. Resumen en 30 segundos
+
+> 🗣️ "The Group Comparator takes a group name and a reference firewall. It finds that group in every firewall where it exists, compares the full tree (the group and all its nested subgroups) against the reference, and lists every firewall with what is **added** (present here, not in the reference) and what is **missing** (in the reference, not here), per subgroup. It also generates the Playflows `add to` / `rm from` commands to align each firewall, and exports the result to CSV. It reads from the Group Lookup tables of ticket 3637 instead of calling the Playflows API live, so it's fast (a fixed number of queries, independent of how many firewalls) but it shows the data from the last sync."
+
+---
+
+## 1. What did you do? (input, logic, output)
+
+### 🗣️ Respuesta corta
+
+> "I extended the existing Group Comparator tab in the Firewall section. **Input**: a group name and a reference FW tag. **Logic**: load the group tree for every firewall from the DB, compare each one against the reference group by group with set differences, and build the alignment commands. **Output**: a summary table (one row per firewall, with status and added/missing counts), an expandable detail per subgroup, a copy button for the alignment commands, and a CSV export."
+
+### 1.1 Dónde vive
+
+| Pieza | Fichero |
+|---|---|
+| Pestaña existente (no es un formulario nuevo) | `templates/tools/firewall.html` → pestaña **Group Comparator** en `/rss/firewall` |
+| Lógica y vista | `rss/views.py`, sección Firewall: `to_hashable`, `load_group_maps_by_tag`, `build_group_map`, `diff_group_maps`, `build_alignment_commands`, `compare_group_across_firewalls`, `ajax_load_data_group_comparator` |
+| Resultado | `templates/tools/firewall_components/group_comparator_component.html` |
+| Celdas de valores ("+N more") | `templates/tools/firewall_components/group_comparator_values.html` |
+| Export CSV | Rama `EXPORT_GROUP_COMPARATOR` en `download_csv_stream_report` + `build_group_comparator_csv_rows` |
+| Tests | `rss/test_group_comparator.py` (+ test del CSV) |
+| Datos | Tablas del Group Lookup (3637): `pf_tag_group` y `pf_tag_group_children` |
+
+### 1.2 Input
+
+| Campo | Ejemplo | Para qué |
+|---|---|---|
+| **Group name** | `GECD_FORCE_PROD` | Grupo a comparar. Búsqueda **exacta** por nombre. |
+| **Tag name** (referencia) | `REF_FW` | El firewall que se considera "correcto". Todo se compara contra él. |
+
+Petición que se genera al pulsar **Apply**:
+```
+GET /rss/ajax_load_data_group_comparator/?group_name=GECD_FORCE_PROD&tag_name=REF_FW
+```
+Los dos valores pasan por `.strip()`, porque en una prueba llegó el nombre con un espacio al final.
+
+### 1.3 Logic, paso a paso
+
+```
+ajax_load_data_group_comparator(request)
+ ├─ 1. load_group_maps_by_tag(group_name)            → reads DB, level by level, all FWs at once
+ │      └─ build_group_map(...)                      → the tree of that group in one FW
+ ├─ 2. compare_group_across_firewalls(...)           → every FW vs the reference
+ │      ├─ diff_group_maps(...)                      → added/missing per subgroup (set difference)
+ │      └─ build_alignment_commands(...)             → "add to" / "rm from" commands
+ └─ 3. render(group_comparator_component.html)       → server-side HTML (team convention)
+```
+
+**Paso 1. Cargar los datos.** `load_group_maps_by_tag` recorre la base de datos **por niveles** (BFS):
+- Nivel 0: todas las filas de `pf_tag_group` con `name = group_name`, **en todos los firewalls a la vez**.
+- Después pide en **una sola consulta** todos los hijos de ese nivel a `pf_tag_group_children`.
+- Repite con los hijos que todavía no ha cargado, hasta que no queda ninguno.
+- Si un grupo ya se ha cargado, no se vuelve a pedir. Eso **evita ciclos** y los grupos compartidos se cargan una sola vez.
+- Por cada firewall monta un "mapa": `{grupo: {'members': {...}, 'subgroups': {...}}}`.
+
+**Paso 2. Comparar.** Por cada firewall distinto de la referencia, `diff_group_maps` recorre el árbol desde la raíz y, grupo a grupo, aplica **resta de conjuntos**:
+- `added = este_FW - referencia`: lo que **sobra**.
+- `missing = referencia - este_FW`: lo que **falta**.
+- Lo hace tanto para los valores (IPs/servicios) como para los subgrupos enteros.
+- Solo baja a los subgrupos que existen **en los dos** (intersección). Si falta un subgrupo entero, se reporta como `missing_subgroups` del padre y no se mira dentro.
+- Solo guarda una fila si el grupo tiene alguna diferencia.
+- Cada fila lleva la **ruta** del subgrupo (`subgroup_path`). Si la ruta está vacía es el grupo raíz, que en pantalla se muestra como **N/A**.
+
+**Paso 3. Comandos.** `build_alignment_commands` traduce las diferencias a la sintaxis de Playflows:
+- Lo que falta → `add to <FW>:<GROUP> v1 v2 ...`
+- Lo que sobra → `rm from <FW>:<GROUP> v1 v2 ...`
+- **Primero todos los `add` y después los `rm`**, para que ningún grupo se quede vacío a mitad del proceso.
+
+**Paso 4. Resumen.** `compare_group_across_firewalls` monta la lista final:
+- La referencia va **siempre primera**.
+- Después, los FW **con diferencias**, y al final los idénticos.
+- Cada FW lleva `added_count`, `missing_count`, `differences` y `alignment_commands`.
+
+### 1.4 Output, con el ejemplo del ticket (Aurelien)
+
+Datos:
+```
+REF_FW (reference)                FW_1                              FW_2
+GECD_FORCE_PROD                   GECD_FORCE_PROD                   identical to REF_FW
+├─ 10.3.4.1                       ├─ 10.3.4.1
+├─ 10.3.4.2                       │                  ← missing 10.3.4.2
+├─ Grp1 → 10.34.55.64             ├─ Grp1 → 10.34.55.64
+└─ Grp 2 → 10.45.24.23            └─ Grp 2 → 10.45.24.23, 10.45.24.25   ← added 10.45.24.25
+```
+
+En pantalla:
+```
+GECD_FORCE_PROD found on 3 firewalls · 1 differs from REF_FW          [Export CSV]
+
+FW Tag          Status             Added  Missing
+REF_FW          Reference            -       -
+˅ FW_1 [copy]   2 groups differ      1       1      ← click: expands the detail
+    Subgroup   Added value    Missing value
+    N/A                       10.3.4.2
+    Grp 2      10.45.24.25
+FW_2            Identical            -       -
+```
+
+Botón **copy** de FW_1 (copia al portapapeles; el textarea está oculto):
+```
+add to FW_1:GECD_FORCE_PROD 10.3.4.2
+rm from FW_1:Grp 2 10.45.24.25
+```
+
+**Export CSV** (el formato de la tabla del ticket):
+```
+FW tag,Subgroup,Added value,Missing value
+REF_FW,N/A,,
+FW_1,N/A,,10.3.4.2
+FW_1,Grp 2,10.45.24.25,
+FW_2,N/A,,
+```
+
+Detalles de la interfaz:
+- Si una celda tiene más de 10 valores, enseña 10 y un desplegable **"+N more"** (`<details>` nativo, sin JS).
+- Los subgrupos enteros que sobran o faltan llevan un badge **Group**, para no confundirlos con IPs.
+- El botón de copiar tiene `stopPropagation`, así que copiar no abre ni cierra el detalle.
+- Si el grupo no existe en el FW de referencia, sale "Group X was not found on Y".
+
+### 1.5 Qué cambia respecto al comparador anterior
+
+| | Antes | Ahora |
+|---|---|---|
+| Fuente | API de Playflows en directo (`POST /search` con `pattern`) | Tablas del Group Lookup (3637) |
+| Selección del grupo | `matches[0]` sin filtrar: podía coger otro grupo, p. ej. `GECD_FORCE_PROD_BLOCK` al buscar `GECD_FORCE_PROD` | Nombre **exacto** |
+| Subgrupos | Contenido aplanado | Árbol completo; la diferencia se atribuye al subgrupo concreto |
+| FW listados | Solo discrepancias | **Todos** los FW donde existe el grupo, también los idénticos |
+| Extra | — | Comandos de alineación + export CSV |
+
+---
+
+## 2. Permission: who can access this part?
+
+### 🗣️ Respuesta corta
+
+> "No new permission was created: it reuses the permissions that already protected this area. The comparator view requires login plus `user_can_change_firewall`, the same check as the Firewall section and the other firewall AJAX tools. The CSV export goes through the shared `download_csv_stream_report`, which requires `user_can_download_report`, like every other CSV export."
+
+### Detalle
+
+| Acción | Protección | Dónde |
+|---|---|---|
+| Ver el comparador (Apply) | `@login_required` + `@user_passes_test(user_can_change_firewall)` | `ajax_load_data_group_comparator` en `rss/views.py` |
+| Descargar el CSV | `@login_required()` + `@user_passes_test(user_can_download_report)` | `download_csv_stream_report` en `rss/views.py` |
+
+- La pestaña ya existía dentro de `/rss/firewall`, así que quien no tiene acceso a Firewall no la ve.
+- La seguridad real está en la **vista**, no solo en la interfaz: llamar a la URL directamente sin permiso no devuelve datos.
+- Siguiendo la convención del proyecto, los permisos no van en el `Meta` de los modelos. Se comprueban en `bookmark/permissions.py` y se asignan a los grupos LDAP en `ldap_user.py`. No añadí ninguno, así que **no hay que crear nada a mano en STG/PROD** para este ticket.
+
+### ⚠️ Lo que te pueden preguntar
+
+**"So who exactly can use it?"** Responde con los grupos LDAP reales. Antes de la reunión, ejecuta esta consulta contra **STG** (cambia el codename por el que compruebe `user_can_change_firewall` en `bookmark/permissions.py`):
+
+```sql
+SELECT g.name, p.codename
+FROM auth_group g
+JOIN auth_group_permissions gp ON gp.group_id = g.id
+JOIN auth_permission p ON p.id = gp.permission_id
+WHERE p.codename IN ('<codename of user_can_change_firewall>', '<codename of user_can_download_report>')
+ORDER BY p.codename, g.name;
+```
+
+**"Can someone see the comparator but not export it?"** Sí, si tiene el permiso de firewall pero no el de descarga. En ese caso el botón **Export CSV** le redirige al login.
+- Respuesta honesta: *"Yes, the two checks are independent, same as the rest of the dashboard. If we want to avoid that, I can render the Export button only for users with the download permission (one `{% if %}` in the template)."*
+- Pruébalo antes con un usuario que no sea admin.
+
+**"Do the alignment commands change anything?"** No. Solo se generan y se copian al portapapeles. El comparador es de **solo lectura**: no llama a Playflows ni escribe en la BD.
+
+---
+
+## 3. Complexity of your code?
+
+### 🗣️ Respuesta corta
+
+> "Database side: **2 queries per level of nesting**, not per group and not per firewall. A group with 2 levels is 4 queries whether it exists on 3 firewalls or 300, so there's no N+1. In memory, it's linear in the size of the data: every group is loaded once and compared once per firewall using set operations, which are O(1) per element. Code-wise it's split into small pure functions (no DB access) that are unit-tested, plus one loader that is the only part touching the DB."
+
+### 3.1 Base de datos (lo que más importa)
+
+| Medida | Valor |
+|---|---|
+| Consultas | **2 × D**, siendo D el número de niveles del árbol: 1 de grupos + 1 de relaciones por nivel. |
+| Ejemplo | `GECD_FORCE_PROD` con 1 nivel de subgrupos → **4 consultas**. Hay un test que lo comprueba con `assertNumQueries(4)`. |
+| Depende del nº de firewalls | **No.** Cada nivel trae todos los FW en la misma consulta. |
+| Depende del nº de grupos | **No** en número de consultas; solo en filas devueltas. |
+| Alternativa ingenua | 1 consulta por grupo y por FW → `G × F` consultas (problema N+1). |
+
+Ejemplo de escala: un grupo con 3 niveles en 40 firewalls → **6 consultas**. Con N+1 serían cientos.
+
+### 3.2 Tiempo en memoria (Big-O)
+
+Notación:
+- **F** = número de firewalls donde existe el grupo.
+- **G** = número de grupos del árbol (raíz + subgrupos) en un FW.
+- **M** = número total de valores (IPs/servicios) del árbol en un FW.
+
+| Función | Coste | Por qué |
+|---|---|---|
+| `load_group_maps_by_tag` | O(F · (G + M)) | Cada fila se lee una vez y se mete en un set. |
+| `build_group_map` | O(G + M) por FW | Visita cada grupo una vez (`if group_name in group_map: continue`). |
+| `diff_group_maps` | O(G + M) por FW, + ordenar diferencias | La resta de sets es O(tamaño); cada grupo se compara una vez (`visited`). |
+| `build_alignment_commands` | O(diferencias) | Recorre las filas con diferencias. |
+| `compare_group_across_firewalls` | O(F · (G + M)) + O(F log F) | Un diff por FW + ordenación. |
+| CSV | O(filas de diferencias) | Generador en streaming: no carga el fichero entero en memoria. |
+
+**Total: lineal en el volumen de datos, O(F · (G + M)).** No hay bucles anidados que comparen todo con todo.
+
+**Memoria:** O(F · (G + M)), es decir, los árboles del grupo en todos los FW. Para grupos normales son kilobytes.
+
+### 3.3 Complejidad del código (legibilidad y mantenimiento)
+
+- **7 funciones pequeñas**, cada una con una sola responsabilidad.
+- **Solo una toca la BD** (`load_group_maps_by_tag`). Las demás son puras: con la misma entrada dan la misma salida y se testean sin BD.
+- Sin dependencias nuevas: solo `collections.defaultdict`, `collections.deque` y `json`, de la librería estándar.
+- **Cambiar la fuente de datos** (p. ej. volver a la API) solo obliga a tocar el loader. La comparación, la vista, la plantilla y el CSV no cambian.
+- **Robustez:**
+  - Ciclos: protegidos con `visited` / `group_index`.
+  - Subgrupos con varios padres: se comparan una vez, por la ruta más corta (BFS).
+  - `content` vacío o `NULL`: se trata como un grupo vacío.
+  - Mismo nombre como `ip` y como `service`: se juntan.
+
+### 3.4 Tests
+
+`python manage.py test rss.test_group_comparator`
+
+| Clase | Qué cubre | BD |
+|---|---|---|
+| `GroupComparatorLogicTests` | Ejemplo del ticket, orden, subgrupo que falta, rutas anidadas, ciclos, subgrupos compartidos | No |
+| `GroupComparatorAlignmentCommandTests` | Formato de comandos, `add` antes que `rm`, vacío si no hay diferencias | No |
+| `GroupComparatorTemplateTests` | Resumen, badges, `N/A`, "+N more", badge Group, botón copiar, "not found" | No |
+| `GroupComparatorDatabaseTests` | Carga real desde `pf_tag_group`, **`assertNumQueries(4)`**, grupo inexistente | Sí (BD de test) |
+| `GroupComparatorCsvRowsTests` | Filas del CSV con el layout del ticket | No |
+
+---
+
+## 4. What's the limit of the query search?
+
+Lo más probable es que la pregunta vaya por aquí: qué encuentra, qué no encuentra y hasta dónde escala. Ten las respuestas claras.
+
+### 🗣️ Respuesta corta
+
+> "The search is an **exact, case-sensitive match** on the group name, across **all firewall tags that are synced** in the Group Lookup tables. There's no hard limit on depth or number of firewalls: it walks the whole tree until there are no more children, and it's cycle-safe. The real limits are: (1) the data is as fresh as the last `playflows_groups_update` sync, (2) only firewalls where the group exists appear, and (3) only tags that have been synced are included."
+
+### 4.1 Límites funcionales (qué encuentra y qué no)
+
+| Límite | Detalle | Cómo se podría ampliar |
+|---|---|---|
+| **Coincidencia exacta** | `filter(name=group_name)`. No hay búsqueda parcial ni comodines, y distingue mayúsculas. `gecd_force_prod` no encuentra `GECD_FORCE_PROD`. Es a propósito: el comparador anterior, con búsqueda por patrón, podía coger `GECD_FORCE_PROD_BLOCK`. | `name__iexact` para ignorar mayúsculas. |
+| **Frescura de datos** | Lee la **última sincronización** de `playflows_groups_update`. Un cambio hecho en Playflows hace 5 minutos no aparece hasta el siguiente sync. Además usa la versión `upcoming` del sync, que es lo que trae el comando. | Programar el sync con más frecuencia o añadir un botón "refresh this group". |
+| **Solo tags sincronizados** | Si un FW no se ha sincronizado nunca (`--tag-name` o `--all --region`), no aparece. | Programar `--all` por región. |
+| **Solo FW donde existe el grupo** | Un FW que **no tiene** el grupo no sale en la lista. No dice "falta el grupo entero en FW_X". | Pasar una lista de FW esperados y marcar los ausentes. |
+| **Sin filtro de región** | Busca en **todos** los tags sincronizados, de cualquier región. Si el mismo nombre existe en EMEA y APAC, salen los dos. | Filtrar por `tag__region` si se pide. |
+| **El grupo debe existir en la referencia** | Si no está en el FW de referencia, no hay con qué comparar y sale "not found". | — |
+| **Profundidad** | **Sin límite**: baja hasta que no hay más hijos. Los ciclos no lo cuelgan. | Si hiciera falta, un `MAX_DEPTH`. |
+| **Subgrupo que falta entero** | Se reporta en el padre y **no se mira dentro**. | Es intencionado: el contenido ya es "todo missing". |
+
+### 4.2 Límites de rendimiento
+
+- **Consultas acotadas:** 2 por nivel, independientes del nº de FW (ver 3.1).
+- **Índice:** el `UniqueConstraint(tag, name, type)` crea un índice que **empieza por `tag`**. Por eso un `WHERE name = ...` sin tag **puede no usarlo**, y PostgreSQL recorrería `pf_tag_group` entero (~96k filas en DEV). Hoy son milisegundos, pero si la tabla crece mucho la mejora es añadir `models.Index(fields=['name'])`.
+  - 🗣️ "Today it's milliseconds. If the table grows, the first optimisation would be an index on `name`, because the existing unique index starts with `tag`."
+- **`id__in=pending_ids`:** en niveles con muchos hijos la lista `IN (...)` es larga. PostgreSQL lo maneja bien en estos volúmenes.
+- **Sin paginación:** devuelve todos los FW de una vez. Es razonable porque el máximo son los FW donde existe el grupo (decenas). La interfaz limita cada celda a 10 valores + "+N more".
+- **CSV:** sale en streaming, sin tope de filas. Para este volumen sería suficiente el CSV normal; se usó el stream para seguir el patrón unificado del proyecto.
+
+### 4.3 Comprobación del índice (si te la piden)
+
+En STG:
+```sql
+EXPLAIN ANALYZE SELECT id FROM pf_tag_group WHERE name = 'GECD_FORCE_PROD';
+```
+- Si sale `Seq Scan`, no usa índice.
+- Fíjate en el tiempo total (`Execution Time`) para decir "X ms con N filas".
+
+---
+
+## 5. Preguntas trampa (prepárate)
+
+**"Why not call the Playflows API live like before?"**
+> "Live API means one search call per run, with pattern matching (which picked the wrong group with `matches[0]`), the content flattened (no subgroup attribution), and the latency and availability of Playflows on every click. The 3637 tables already have the tree with parent-child relations, so it's exact, faster and deterministic. The trade-off is data freshness: last sync."
+
+**"Is the sync scheduled? Is the data up to date?"**
+- Depende de que `playflows_groups_update` esté programado en el Programador de tareas de Windows (STG/PROD).
+- ⚠️ **Confírmalo antes de la reunión.** Si no está programado, dilo claro: *"The comparator is only as fresh as the sync; scheduling it per region is a prerequisite for production."*
+- Cada ejecución queda registrada en `task_date` (`task_name = 'playflows_groups_update'`), así que se puede ver cuándo fue la última.
+
+**"Does it depend on ticket 3637?"**
+> "Yes, it uses the `tag` FK and the `children` M2M from 3637, so 3637 has to be merged/deployed first (including its migration and the first sync)."
+
+**"Are the alignment commands safe to run?"**
+- Son una propuesta: no se ejecutan solos.
+- Antes de usarlos en producción hay que validar en DEV tres cosas:
+  1. que `FW:GROUP` sirve también para meter o quitar **subgrupos**;
+  2. que Playflows acepta las IPs con `/32`;
+  3. que, si falta un subgrupo entero, ese subgrupo ya existe en el FW destino (si no, hay que crearlo antes).
+- Se generan `add` antes que `rm` a propósito.
+
+**"What if the group has service members, not IPs?"** Se comparan igual. `members` es cualquier valor del contenido; si un mismo nombre existe como `ip` y como `service` en un FW, se juntan.
+
+**"What happens with a cycle (A contains B, B contains A)?"** No se cuelga: el loader no recarga ids ya vistos y el diff usa `visited`. Hay un test para ello.
+
+**"Why BFS and not recursion?"**
+- No tiene límite de recursión de Python.
+- Permite cargar **un nivel entero en una sola consulta**. Esa es la clave del número de consultas.
+- En el diff garantiza que un subgrupo con varios padres se compara una vez, con la ruta más corta.
+
+**"Why server-side HTML and not JSON?"** Es la convención del equipo para las búsquedas (como `avi_waf_search`), y además permite testear la plantilla desde Django.
+
+**"Why `download_csv_stream_report` if the result is small?"** Es el punto único de exports CSV del proyecto: misma URL, mismos permisos, mismo formato. Para este tamaño el streaming no es necesario, pero tampoco penaliza.
+
+---
+
+## 6. Checklist antes de la reunión
+
+- [ ] Abrir `bookmark/permissions.py` y apuntar el **codename** de `user_can_change_firewall` y de `user_can_download_report`.
+- [ ] Ejecutar la consulta SQL del apartado 2 en **STG** para saber **qué grupos LDAP** tienen cada permiso.
+- [ ] Probar con un usuario **no admin**: ver el comparador y pulsar Export CSV.
+- [ ] Mirar en `task_date` cuándo fue el último `playflows_groups_update` y si está programado.
+- [ ] `python manage.py test rss.test_group_comparator` (y el test del CSV) → `OK`. Llevar el número de tests que pasan.
+- [ ] (Opcional) `EXPLAIN ANALYZE` del apartado 4.3 para dar una cifra real en ms.
+- [ ] Tener abierta una comparación real (p. ej. `GECD_FORCE_PROD`) para enseñar en directo: tabla, detalle, copy y CSV.
