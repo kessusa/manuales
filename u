@@ -8,3 +8,15 @@ FROM public.task_date t,
 WHERE t.name = 'playflows_groups_update'
   AND elem->>'level' <> 'info'
 ORDER BY t.id DESC;
+
+
+SELECT elem->>'tag'    AS tag,
+       elem->>'level'  AS level,
+       elem->>'detail' AS detail,
+       count(*)        AS times
+FROM public.task_date t,
+     jsonb_array_elements(t.message::jsonb) AS elem
+WHERE t.name = 'playflows_groups_update'
+  AND elem->>'level' <> 'info'
+GROUP BY 1, 2, 3
+ORDER BY times DESC;
