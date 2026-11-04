@@ -1,0 +1,10 @@
+SELECT t.id,
+       t.created_at,
+       elem->>'tag'    AS tag,
+       elem->>'level'  AS level,
+       elem->>'detail' AS detail
+FROM public.task_date t,
+     jsonb_array_elements(t.message::jsonb) AS elem
+WHERE t.name = 'playflows_groups_update'
+  AND elem->>'level' <> 'info'
+ORDER BY t.id DESC;
