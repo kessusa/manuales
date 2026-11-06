@@ -1,0 +1,191 @@
+<div class="mt-5">
+    {% for item in result %}
+        {% if item.match_flow_results|has_drop or item.cis_result|has_drop %}
+            <div class="flows-to-code-container">
+                <div class="card mb-4 shadow-none">
+                    {% ifchanged %}
+                        <h6 class="fw-bold mb-3">Flows to Code</h6>
+                    {% endifchanged %}
+
+                    <div class="card-header bg-light d-flex justify-content-between align-items-center"
+                         role="button" data-bs-toggle="collapse"
+                         data-bs-target="#flows-collapse-{{ item.ar_number|stringformat:'s' }}"
+                         aria-expanded="false" aria-controls="flows-collapse-{{ item.ar_number|stringformat:'s' }}">
+                        <h6 class="mb-0">AR{{ item.ar_number }}</h6>
+                        <i class="fas fa-chevron-down"></i>
+                    </div>
+
+                    <div class="collapse" id="flows-collapse-{{ item.ar_number|stringformat:'s' }}">
+                        <div class="card-body">
+                            <div class="table-responsive">
+                                <table class="table table-responsive mb-0 table-striped">
+                                    <thead>
+                                    <tr class="text-nowrap">
+                                        <th scope="col" class="border-0">Tag</th>
+                                        <th scope="col" class="border-0">Source</th>
+                                        <th scope="col" class="border-0">Destination</th>
+                                        <th scope="col" class="border-0">Port</th>
+                                        <th scope="col" class="border-0"></th>
+                                    </tr>
+                                    </thead>
+                                    <tbody>
+                                    {# --- MATCH FLOWS DROPS --- #}
+                                    {% regroup item.match_flow_results by tag as match_flows_by_tag %}
+                                    {% for tag_group in match_flows_by_tag %}
+                                        {% regroup tag_group.list by position as flows_by_position %}
+                                        {% for position_group in flows_by_position %}
+                                            {% with position_group.list.0 as first_rule %}
+                                                {% if 'drop' in first_rule.action %}
+                                                    <tr>
+                                                        <td class="fw-bold">{{ tag_group.grouper }}</td>
+                                                        <td class="fw-normal">
+                                                            {% for el in position_group.list|unique_items:"source" %}
+                                                                {{ el.0 }} <i class="fas fa-long-arrow-alt-right me-1"></i>{{ el.1 }}<br>
+                                                            {% empty %}-{% endfor %}
+                                                        </td>
+                                                        <td class="fw-normal">
+                                                            {% for el in position_group.list|unique_items:"destination" %}
+                                                                {{ el.0 }} <i class="fas fa-long-arrow-alt-right me-1"></i>{{ el.1 }}<br>
+                                                            {% empty %}-{% endfor %}
+                                                        </td>
+                                                        <td class="fw-normal">
+                                                            {% for srv in position_group.list|unique_items:"service" %}
+                                                                {{ srv }}<br>
+                                                            {% empty %}-{% endfor %}
+                                                        </td>
+                                                        <td>
+                                                            <button type="button" class="btn btn-sm btn-outline-primary copy-btn"
+                                                                    data-content-id="to-code-{{ item.ar_number }}-{{ forloop.parentloop.counter }}-{{ forloop.counter }}"
+                                                                    data-bs-toggle="tooltip" data-bs-placement="bottom">
+                                                                <i class="far fa-copy me-1"></i>Copy
+                                                            </button>
+                                                            <div id="to-code-{{ item.ar_number }}-{{ forloop.parentloop.counter }}-{{ forloop.counter }}" class="d-none">
+                                                                <div class="tag-line">#{{ tag_group.grouper }}</div>
+                                                                <div class="src-section">{% for el in position_group.list|unique_items:"source" %}<div class="src-line">{{ el.0 }}</div>{% endfor %}</div>
+                                                                <div class="dst-section">{% for el in position_group.list|unique_items:"destination" %}<div class="dst-line">{{ el.0 }}</div>{% endfor %}</div>
+                                                                <div class="srv-section">{% for srv in position_group.list|unique_items:"service" %}<div class="srv-line">{{ srv }}</div>{% endfor %}</div>
+                                                            </div>
+                                                        </td>
+                                                    </tr>
+                                                {% endif %}
+                                            {% endwith %}
+                                        {% endfor %}
+                                    {% endfor %}
+
+                                    {# --- CIS FLOWS DROPS --- #}
+                                    {% regroup item.cis_result by tag as cis_flows_by_tag %}
+                                    {% for tag_group in cis_flows_by_tag %}
+                                        {% regroup tag_group.list by position as cis_flows_by_position %}
+                                        {% for position_group in cis_flows_by_position %}
+                                            {% with position_group.list.0 as first_rule %}
+                                                {% if 'drop' in first_rule.action %}
+                                                    <tr>
+                                                        <td class="fw-bold">{{ tag_group.grouper }}</td>
+                                                        <td class="fw-normal">
+                                                            {% for el in position_group.list|unique_items:"source" %}
+                                                                {{ el.0 }} <i class="fas fa-long-arrow-alt-right me-1"></i>{{ el.1 }}<br>
+                                                            {% empty %}-{% endfor %}
+                                                        </td>
+                                                        <td class="fw-normal">
+                                                            {% for el in position_group.list|unique_items:"destination" %}
+                                                                {{ el.0 }} <i class="fas fa-long-arrow-alt-right me-1"></i>{{ el.1 }}<br>
+                                                            {% empty %}-{% endfor %}
+                                                        </td>
+                                                        <td class="fw-normal">
+                                                            {% for srv in position_group.list|unique_items:"service" %}
+                                                                {{ srv }}<br>
+                                                            {% empty %}-{% endfor %}
+                                                        </td>
+                                                        <td>
+                                                            <button type="button" class="btn btn-sm btn-outline-primary copy-btn"
+                                                                    data-content-id="to-code-cis-{{ item.ar_number }}-{{ forloop.parentloop.counter }}-{{ forloop.counter }}"
+                                                                    data-bs-toggle="tooltip" data-bs-placement="bottom">
+                                                                <i class="far fa-copy me-1"></i>Copy
+                                                            </button>
+                                                            <div id="to-code-cis-{{ item.ar_number }}-{{ forloop.parentloop.counter }}-{{ forloop.counter }}" class="d-none">
+                                                                <div class="tag-line">#{{ tag_group.grouper }}</div>
+                                                                <div class="src-section">{% for el in position_group.list|unique_items:"source" %}<div class="src-line">{{ el.0 }}</div>{% endfor %}</div>
+                                                                <div class="dst-section">{% for el in position_group.list|unique_items:"destination" %}<div class="dst-line">{{ el.0 }}</div>{% endfor %}</div>
+                                                                <div class="srv-section">{% for srv in position_group.list|unique_items:"service" %}<div class="srv-line">{{ srv }}</div>{% endfor %}</div>
+                                                            </div>
+                                                        </td>
+                                                    </tr>
+                                                {% endif %}
+                                            {% endwith %}
+                                        {% endfor %}
+                                    {% endfor %}
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        {% endif %}
+    {% endfor %}
+</div>
+
+<script type="text/javascript">
+    $(document).ready(function () {
+        $('.copy-btn').click(function (event) {
+            event.stopPropagation();
+            const contentId = $(this).data('content-id');
+            const contentElement = document.getElementById(contentId);
+
+            if (contentElement) {
+                let lines = [];
+                const tagLine = contentElement.querySelector('.tag-line').textContent.trim();
+                lines.push(tagLine);
+
+                lines.push('SRC');
+                const srcElements = contentElement.querySelectorAll('.src-line');
+                srcElements.forEach(el => {
+                    lines.push(el.textContent.trim());
+                });
+
+                lines.push('DST');
+                const dstElements = contentElement.querySelectorAll('.dst-line');
+                dstElements.forEach(el => {
+                    lines.push(el.textContent.trim());
+                });
+
+                lines.push('SRV');
+                const srvElements = contentElement.querySelectorAll('.srv-line');
+                srvElements.forEach(el => {
+                    lines.push(el.textContent.trim());
+                });
+
+                const formattedText = lines.join('\n');
+
+                const tempElement = document.createElement('textarea');
+                tempElement.value = formattedText;
+                document.body.appendChild(tempElement);
+                tempElement.select();
+                document.execCommand('copy');
+                document.body.removeChild(tempElement);
+
+                iziToast.success({
+                    position: "topRight",
+                    message: 'Text Copied',
+                });
+            }
+        });
+
+        const tooltipTriggerList = [].slice.call(document.querySelectorAll('[data-bs-toggle="tooltip"]'));
+        tooltipTriggerList.map(function (tooltipTriggerEl) {
+            return new bootstrap.Tooltip(tooltipTriggerEl);
+        });
+
+        $('.collapse').on('show.bs.collapse', function () {
+            $(this).prev('.card-header').find('.fas')
+                .removeClass('fa-chevron-down')
+                .addClass('fa-chevron-up');
+        });
+
+        $('.collapse').on('hide.bs.collapse', function () {
+            $(this).prev('.card-header').find('.fas')
+                .removeClass('fa-chevron-up')
+                .addClass('fa-chevron-down');
+        });
+    });
+</script>
