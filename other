@@ -1,0 +1,2165 @@
+# Suite Maestra de Automatización SecOps Perimetral (WAF & Firewall Multivendor)
+
+Documentación técnica, manual de operaciones y código fuente completo para la automatización de respuesta a incidentes (Virtual Patching), auditoría de overrides/excepciones, mapeo de activos backend e higiene de reglas de firewall en entornos **VMware Avi WAF**, **F5 BIG-IP ASM/AWAF**, **Akamai AppSec** y **Fortinet FortiManager**.
+
+---
+
+## Índice
+
+1. [Requisitos del Sistema e Instalación](#1-requisitos-del-sistema-e-instalación)
+2. [Configuración de Credenciales y Variables de Entorno](#2-configuración-de-credenciales-y-variables-de-entorno)
+3. [Matriz de Operaciones Multivendor](#3-matriz-de-operaciones-multivendor)
+4. [Bloque 1: VMware Avi Load Balancer (iWAF)](#4-bloque-1-vmware-avi-load-balancer-iwaf)
+   - `avi_client.py`
+   - `01_map_waf_to_backends.py`
+   - `02_audit_waf_overrides.py`
+   - `03_manage_pre_crs.py`
+   - `04_manage_crs_signatures.py`
+   - `05_set_policy_mode.py`
+   - `06_rollback_policy.py`
+5. [Bloque 2: F5 BIG-IP ASM / Advanced WAF](#5-bloque-2-f5-big-ip-asm--advanced-waf)
+   - `f5_client.py`
+   - `f5_01_map_backends.py`
+   - `f5_02_audit_policy.py`
+   - `f5_03_enforce_signatures.py`
+   - `f5_04_exceptions_and_patching.py`
+6. [Bloque 3: Akamai Application Security (AppSec API v1)](#6-bloque-3-akamai-application-security-appsec-api-v1)
+   - `akamai_client.py`
+   - `akamai_01_inventory_audit.py`
+   - `akamai_02_enforce_rules_groups.py`
+   - `akamai_03_custom_rules_and_exceptions.py`
+7. [Bloque 4: Fortinet FortiManager (Firewall Hygiene & Finder)](#7-bloque-4-fortinet-fortimanager-firewall-hygiene--finder)
+   - `fmg_client.py`
+   - `fmg_01_clean_unused_rules.py`
+   - `fmg_02_detect_shadow_rules.py`
+   - `fmg_03_consolidate_policies.py`
+   - `fmg_04_smart_policy_finder.py`
+
+---
+
+## 1. Requisitos del Sistema e Instalación
+
+* **Python:** `3.9` o superior.
+* **Librerías necesarias:**
+
+```bash
+pip install requests urllib3 avisdk edgegrid-python
+```
+
+| Librería | Uso en la Suite |
+|---|---|
+| `requests` / `urllib3` | Comunicación REST/JSON-RPC con F5 iControl REST, FortiManager y Akamai. |
+| `avisdk` | Gestión de sesiones, tokens CSRF, cabeceras de versión y paginación en VMware Avi. |
+| `edgegrid-python` | Firma criptográfica de peticiones API (`EdgeGridAuth`) y lectura de `~/.edgerc` en Akamai. |
+
+---
+
+## 2. Configuración de Credenciales y Variables de Entorno
+
+Exporta las variables correspondientes a la plataforma sobre la que vayas a operar antes de lanzar los scripts:
+
+```bash
+# ==========================================
+# 1. VMWARE AVI LOAD BALANCER (iWAF)
+# ==========================================
+export AVI_CONTROLLER="10.0.0.10"
+export AVI_USER="admin"
+export AVI_PASSWORD="TuPasswordAvi"
+export AVI_TENANT="admin"
+export AVI_VERSION="22.1.5"
+
+# ==========================================
+# 2. F5 BIG-IP ASM / AWAF
+# ==========================================
+export F5_HOST="10.0.0.20"
+export F5_USER="admin"
+export F5_PASS="TuPasswordF5"
+
+# ==========================================
+# 3. AKAMAI APPLICATION SECURITY
+# ==========================================
+export AKAMAI_EDGERC="~/.edgerc"
+export AKAMAI_SECTION="default"
+# Alternativa sin fichero .edgerc:
+# export AKAMAI_HOST="akab-xxxx.luna.akamaiapis.net"
+# export AKAMAI_CLIENT_TOKEN="akab-..."
+# export AKAMAI_CLIENT_SECRET="..."
+# export AKAMAI_ACCESS_TOKEN="akab-..."
+
+# ==========================================
+# 4. FORTINET FORTIMANAGER
+# ==========================================
+export FMG_HOST="10.0.0.50"
+export FMG_USER="admin"
+export FMG_PASS="TuPasswordFMG"
+# Opcional en FMG 7.2+:
+export FMG_TOKEN=""
+```
+
+---
+
+## 3. Matriz de Operaciones Multivendor
+
+| Operación SecOps | Script VMware Avi | Script F5 ASM | Script Akamai AppSec |
+|---|---|---|---|
+| **Mapear Topología / Activos** | `01_map_waf_to_backends.py` | `f5_01_map_backends.py` | `akamai_01_inventory_audit.py` |
+| **Auditar Overrides y Excepciones** | `02_audit_waf_overrides.py` | `f5_02_audit_policy.py` | `akamai_01_inventory_audit.py --details` |
+| **Parcheo Virtual (0-Day / CVE)** | `03_manage_pre_crs.py` | `f5_04_exceptions_and_patching.py` | `akamai_03_custom_rules_and_exceptions.py custom-rule` |
+| **Forzar Firmas / Grupos a Bloqueo** | `04_manage_crs_signatures.py` | `f5_03_enforce_signatures.py` | `akamai_02_enforce_rules_groups.py` |
+| **Crear Excepción (Falso Positivo)** | `02_audit_waf_overrides.py` (Inspección) | `f5_04_exceptions_and_patching.py` | `akamai_03_custom_rules_and_exceptions.py exception` |
+| **Cambiar Modo Global / Activar** | `05_set_policy_mode.py` | `f5_03_enforce_signatures.py --policy-mode` | `akamai_03_custom_rules_and_exceptions.py activate` |
+
+---
+
+## 4. Bloque 1: VMware Avi Load Balancer (iWAF)
+
+### 4.1. Módulo Base: `avi_client.py`
+Centraliza la autenticación contra el Avi Controller, resuelve la paginación de resultados y guarda automáticamente una copia de seguridad íntegra en JSON dentro de `./backups/` antes de cualquier modificación.
+
+```python
+# avi_client.py
+import os
+import json
+import urllib3
+from datetime import datetime
+from avi.sdk.avi_api import ApiSession
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+AVI_CONTROLLER = os.getenv("AVI_CONTROLLER", "10.0.0.10")
+AVI_USER = os.getenv("AVI_USER", "admin")
+AVI_PASSWORD = os.getenv("AVI_PASSWORD", "VMware1!")
+AVI_TENANT = os.getenv("AVI_TENANT", "admin")
+AVI_VERSION = os.getenv("AVI_VERSION", "22.1.5")
+
+def get_session():
+    return ApiSession.get_session(
+        controller_ip=AVI_CONTROLLER,
+        username=AVI_USER,
+        password=AVI_PASSWORD,
+        tenant=AVI_TENANT,
+        api_version=AVI_VERSION,
+        verify=False
+    )
+
+def fetch_all(api, endpoint, params=None):
+    """Obtiene todos los objetos manejando la paginación de Avi"""
+    query = {"page_size": 200}
+    if params:
+        query.update(params)
+    resp = api.get(endpoint, params=query)
+    resp.raise_for_status()
+    return resp.json().get("results", [])
+
+def filter_policies(api, policy_filter=None):
+    policies = fetch_all(api, "wafpolicy")
+    if policy_filter:
+        return [p for p in policies if policy_filter.lower() in p["name"].lower()]
+    return policies
+
+def backup_policy(policy):
+    os.makedirs("backups", exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    fname = f"backups/{policy['name']}_{ts}.json"
+    with open(fname, "w", encoding="utf-8") as f:
+        json.dump(policy, f, indent=2)
+    return fname
+```
+
+---
+
+### 4.2. Mapeo de Backends: `01_map_waf_to_backends.py`
+* **Qué hace:** Cruza `WafPolicy` $\rightarrow$ `VirtualService` $\rightarrow$ `Pool` y `PoolGroup` para descubrir exactamente qué servidores (`IP:Puerto`, `Hostname` y estado `ENABLED/DISABLED`) están protegidos detrás de cada política WAF.
+* **Argumentos:**
+  * `--filter <texto>`: Filtra por nombre de política WAF.
+  * `--json`: Exporta el árbol completo al archivo `waf_backend_inventory.json`.
+* **Ejemplo:** `python 01_map_waf_to_backends.py --filter "Prod" --json`
+
+```python
+# 01_map_waf_to_backends.py
+import argparse
+import json
+from avi_client import get_session, fetch_all
+
+def extract_uuid(ref_url):
+    return ref_url.split("/")[-1] if ref_url else None
+
+def map_waf_inventory(policy_filter=None, export_json=False):
+    api = get_session()
+    waf_policies = {p["uuid"]: p for p in fetch_all(api, "wafpolicy")}
+    vservices = fetch_all(api, "virtualservice")
+    pools = {p["uuid"]: p for p in fetch_all(api, "pool")}
+    poolgroups = {pg["uuid"]: pg for pg in fetch_all(api, "poolgroup")}
+
+    inventory = {}
+
+    for waf_uuid, waf in waf_policies.items():
+        if policy_filter and policy_filter.lower() not in waf["name"].lower():
+            continue
+        inventory[waf["name"]] = {
+            "waf_uuid": waf_uuid,
+            "mode": waf.get("mode"),
+            "virtual_services": []
+        }
+
+    for vs in vservices:
+        waf_ref = vs.get("waf_policy_ref")
+        if not waf_ref:
+            continue
+        waf_uuid = extract_uuid(waf_ref)
+        if waf_uuid not in waf_policies:
+            continue
+        waf_name = waf_policies[waf_uuid]["name"]
+        if waf_name not in inventory:
+            continue
+
+        associated_pool_uuids = set()
+        if vs.get("pool_ref"):
+            associated_pool_uuids.add(extract_uuid(vs["pool_ref"]))
+        if vs.get("pool_group_ref"):
+            pg_uuid = extract_uuid(vs["pool_group_ref"])
+            pg = poolgroups.get(pg_uuid, {})
+            for member in pg.get("members", []):
+                if member.get("pool_ref"):
+                    associated_pool_uuids.add(extract_uuid(member["pool_ref"]))
+
+        vs_pools_info = []
+        for p_uuid in associated_pool_uuids:
+            pool_obj = pools.get(p_uuid)
+            if not pool_obj:
+                continue
+            default_port = pool_obj.get("default_server_port", 80)
+            servers_list = []
+            for srv in pool_obj.get("servers", []):
+                ip_addr = srv.get("ip", {}).get("addr", "N/A")
+                hostname = srv.get("hostname", ip_addr)
+                port = srv.get("port", default_port)
+                enabled = srv.get("enabled", True)
+                servers_list.append({
+                    "ip": ip_addr,
+                    "hostname": hostname,
+                    "port": port,
+                    "enabled": enabled
+                })
+            vs_pools_info.append({
+                "pool_name": pool_obj["name"],
+                "servers": servers_list
+            })
+
+        inventory[waf_name]["virtual_services"].append({
+            "vs_name": vs["name"],
+            "enabled": vs.get("enabled", True),
+            "pools": vs_pools_info
+        })
+
+    for waf_name, data in inventory.items():
+        print(f"\n==========================================")
+        print(f"WAF POLICY: {waf_name} (Modo: {data['mode']})")
+        print(f"==========================================")
+        if not data["virtual_services"]:
+            print("  [!] Sin Virtual Services asociados actualmente.")
+        for vs in data["virtual_services"]:
+            print(f"  └── Virtual Service: {vs['vs_name']} (Activo: {vs['enabled']})")
+            for p in vs["pools"]:
+                print(f"       └── Pool: {p['pool_name']}")
+                for s in p["servers"]:
+                    status = "UP/ENABLED" if s["enabled"] else "DISABLED"
+                    print(f"            • Servidor: {s['ip']}:{s['port']} ({s['hostname']}) [{status}]")
+
+    if export_json:
+        with open("waf_backend_inventory.json", "w", encoding="utf-8") as f:
+            json.dump(inventory, f, indent=2)
+        print("\n[+] Inventario exportado a waf_backend_inventory.json")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Mapea qué servidores backend están detrás de cada política WAF")
+    parser.add_argument("--filter", help="Filtrar por nombre de política WAF")
+    parser.add_argument("--json", action="store_true", help="Exportar resultado a JSON")
+    args = parser.parse_args()
+    map_waf_inventory(args.filter, args.json)
+```
+
+---
+
+### 4.3. Auditoría Profunda de Overrides y Excepciones: `02_audit_waf_overrides.py`
+* **Qué hace:** Extrae las reglas `Pre-CRS`, `Post-CRS` y todos los `crs_overrides` (o cambios en `crs_groups`). Con `--details`, inspecciona el esquema `WafExcludeListEntry` mostrando `client_subnet`, `uri_path`, `uri_match_criteria` (`match_op`, `match_case`), `match_element` y `match_element_criteria`.
+* **Argumentos:**
+  * `--filter <texto>`: Filtra por nombre de política WAF.
+  * `--group <texto>`: Filtra por nombre de grupo CRS (ej. `942` o `SQLi`).
+  * `--rule <id>`: Filtra por un `rule_id` específico (ej. `942100`).
+  * `--details`: Desglosa todos los campos configurados en cada excepción (`exclude_list`) y muestra el código de las `SecRule`.
+  * `--raw-json`: Imprime el bloque JSON crudo devuelto por la API de Avi.
+* **Ejemplo:** `python 02_audit_waf_overrides.py --filter "Portal" --details`
+
+```python
+# 02_audit_waf_overrides.py
+import json
+import argparse
+from avi_client import get_session, filter_policies
+
+def format_subnet(subnet_obj):
+    """Formatea el objeto client_subnet de Avi: {'ip_addr': {'addr': '10.0.0.0', 'type': 'V4'}, 'mask': 24}"""
+    if not subnet_obj:
+        return "Cualquiera (All IPs)"
+    ip_addr = subnet_obj.get("ip_addr", {}).get("addr", "N/A")
+    ip_type = subnet_obj.get("ip_addr", {}).get("type", "V4")
+    mask = subnet_obj.get("mask", 32)
+    return f"{ip_addr}/{mask} ({ip_type})"
+
+def print_exclude_list(exclude_list, indent="          "):
+    """Desglosa todos los campos reales de WafExcludeListEntry en la API de Avi"""
+    for idx, exc in enumerate(exclude_list, 1):
+        client_subnet = exc.get("client_subnet")
+        subnet_str = format_subnet(client_subnet)
+
+        uri_path = exc.get("uri_path")
+        uri_crit = exc.get("uri_match_criteria", {})
+        uri_op = uri_crit.get("match_op", "EQUALS (Default)")
+        uri_case = uri_crit.get("match_case", "INSENSITIVE (Default)")
+
+        match_elem = exc.get("match_element")
+        elem_crit = exc.get("match_element_criteria", {})
+        elem_op = elem_crit.get("match_op", "EQUALS (Default)")
+        elem_case = elem_crit.get("match_case", "INSENSITIVE (Default)")
+
+        desc = exc.get("description", "")
+
+        print(f"{indent}┌── [Exclusión #{idx}] {f'({desc})' if desc else ''}")
+        print(f"{indent}│   • Client Subnet          : {subnet_str}")
+
+        if uri_path is not None or uri_crit:
+            print(f"{indent}│   • URI Path               : '{uri_path if uri_path is not None else '*'}'")
+            print(f"{indent}│   • URI Match Criteria     : match_op={uri_op} | match_case={uri_case}")
+        else:
+            print(f"{indent}│   • URI Path               : Cualquiera (No filtrado por URI)")
+
+        if match_elem is not None or elem_crit:
+            print(f"{indent}│   • Match Element          : '{match_elem if match_elem is not None else '*'}'")
+            print(f"{indent}│   • Element Match Criteria : match_op={elem_op} | match_case={elem_case}")
+        else:
+            print(f"{indent}│   • Match Element          : Toda la petición / Firma completa (Bypass total)")
+
+        known_keys = {
+            "client_subnet", "uri_path", "uri_match_criteria",
+            "match_element", "match_element_criteria", "description"
+        }
+        extra_keys = {k: v for k, v in exc.items() if k not in known_keys}
+        if extra_keys:
+            print(f"{indent}│   • Campos adicionales     : {json.dumps(extra_keys)}")
+        print(f"{indent}└──────────────────────────────────────────────────────────")
+
+def print_tags_and_params(obj, indent="             "):
+    """Muestra qué campos específicos se han modificado en el override de grupo o regla"""
+    known_ignore = {"name", "rule_id", "rule_overrides", "exclude_list", "rules", "index"}
+    changed_fields = {k: v for k, v in obj.items() if k not in known_ignore}
+    if changed_fields:
+        fields_str = " | ".join(f"{k}: {v}" for k, v in changed_fields.items())
+        print(f"{indent}Campos configurados en Override -> [ {fields_str} ]")
+
+def audit_overrides(policy_filter=None, group_filter=None, rule_filter=None, details=False, raw_json=False):
+    api = get_session()
+    policies = filter_policies(api, policy_filter)
+
+    for p in policies:
+        print(f"\n======================================================================")
+        print(f"POLÍTICA: {p['name']} (UUID: {p['uuid']})")
+        print(f"Modo Global: {p.get('mode')} | Paranoia: {p.get('paranoia_level')} | Delegación: {p.get('allow_mode_delegation', False)}")
+        print(f"======================================================================")
+
+        for stage_key, stage_label in [("pre_crs_groups", "Pre-CRS"), ("post_crs_groups", "Post-CRS")]:
+            groups = p.get(stage_key, [])
+            if not groups:
+                continue
+            print(f"\n  [{stage_label} Groups]: {len(groups)}")
+            for g in groups:
+                if group_filter and group_filter.lower() not in g["name"].lower():
+                    continue
+                g_excl = g.get("exclude_list", [])
+                print(f"    • Grupo: {g['name']} | Enable: {g.get('enable', True)} | Exclusiones de Grupo: {len(g_excl)}")
+                if details and g_excl:
+                    print_exclude_list(g_excl, indent="        ")
+
+                for r in g.get("rules", []):
+                    if rule_filter and str(r.get("rule_id")) != str(rule_filter):
+                        continue
+                    r_excl = r.get("exclude_list", [])
+                    print(f"       └── Regla ID {r.get('rule_id')} ({r.get('name')}) | Enable: {r.get('enable')} | Mode: {r.get('mode', 'POLICY_MODE')} | Exclusiones: {len(r_excl)}")
+                    if details:
+                        if r.get("rule"):
+                            print(f"             SecRule: {r.get('rule').strip()}")
+                        if r_excl:
+                            print_exclude_list(r_excl, indent="             ")
+                    if raw_json:
+                        print("             [RAW JSON]:\n             " + json.dumps(r, indent=2).replace("\n", "\n             "))
+
+        crs_overrides = p.get("crs_overrides", [])
+        if crs_overrides:
+            print(f"\n  [CRS Overrides configurados]: {len(crs_overrides)} grupos con overrides")
+            for ov in crs_overrides:
+                g_name = ov.get("name", "N/A")
+                if group_filter and group_filter.lower() not in g_name.lower():
+                    continue
+
+                g_enable = ov.get("enable", "Heredado (True)")
+                g_excl = ov.get("exclude_list", [])
+                print(f"\n    • GRUPO CRS: {g_name} | Enable: {g_enable} | Exclusiones de Grupo: {len(g_excl)}")
+
+                if details:
+                    print_tags_and_params(ov, indent="        ")
+                    if g_excl:
+                        print_exclude_list(g_excl, indent="        ")
+
+                if raw_json and not rule_filter:
+                    print("      [RAW GROUP OVERRIDE JSON]:\n      " + json.dumps(ov, indent=2).replace("\n", "\n      "))
+
+                for r_ov in ov.get("rule_overrides", []):
+                    r_id = r_ov.get("rule_id")
+                    if rule_filter and str(r_id) != str(rule_filter):
+                        continue
+
+                    r_en = r_ov.get("enable", "Heredado (True)")
+                    r_mode = r_ov.get("mode", "POLICY_MODE (Heredado)")
+                    r_excl = r_ov.get("exclude_list", [])
+                    print(f"       └── Firma ID {r_id} -> Enable: {r_en} | Mode: {r_mode} | Exclusiones: {len(r_excl)}")
+
+                    if details:
+                        print_tags_and_params(r_ov, indent="             ")
+                        if r_excl:
+                            print_exclude_list(r_excl, indent="             ")
+
+                    if raw_json:
+                        print("             [RAW RULE OVERRIDE JSON]:\n             " + json.dumps(r_ov, indent=2).replace("\n", "\n             "))
+
+        elif p.get("crs_groups"):
+            print("\n  [CRS Groups (Árbol directo - Mostrando grupos/reglas con cambios o exclusiones)]:")
+            for g in p.get("crs_groups", []):
+                if group_filter and group_filter.lower() not in g["name"].lower():
+                    continue
+                g_excl = g.get("exclude_list", [])
+                g_modified = not g.get("enable", True) or bool(g_excl)
+                modified_rules = [
+                    r for r in g.get("rules", [])
+                    if (not r.get("enable", True) or r.get("mode") or r.get("exclude_list"))
+                    and (not rule_filter or str(r.get("rule_id")) == str(rule_filter))
+                ]
+
+                if not g_modified and not modified_rules:
+                    continue
+
+                print(f"\n    • GRUPO CRS: {g['name']} | Enable: {g.get('enable', True)} | Exclusiones de Grupo: {len(g_excl)}")
+                if details and g_excl:
+                    print_exclude_list(g_excl, indent="        ")
+
+                for r in modified_rules:
+                    r_excl = r.get("exclude_list", [])
+                    print(f"       └── Firma ID {r['rule_id']} ({r.get('name')}) -> Enable: {r.get('enable')} | Mode: {r.get('mode', 'POLICY_MODE')} | Exclusiones: {len(r_excl)}")
+                    if details and r_excl:
+                        print_exclude_list(r_excl, indent="             ")
+                    if raw_json:
+                        print("             [RAW RULE JSON]:\n             " + json.dumps(r, indent=2).replace("\n", "\n             "))
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Audita overrides y muestra todos los parámetros de cada excepción WAF")
+    parser.add_argument("--filter", help="Filtrar por nombre de política WAF")
+    parser.add_argument("--group", help="Filtrar por nombre de grupo CRS (ej. 942 o SQLi)")
+    parser.add_argument("--rule", help="Filtrar por un ID de firma específico (ej. 942100)")
+    parser.add_argument("--details", action="store_true", help="Muestra client_subnet, uri_path, uri_match_criteria, match_element y match_element_criteria")
+    parser.add_argument("--raw-json", action="store_true", help="Imprime el JSON puro devuelto por Avi para cada override")
+    args = parser.parse_args()
+    audit_overrides(args.filter, args.group, args.rule, args.details, args.raw_json)
+```
+
+---
+
+### 4.4. Parcheo Virtual Pre-CRS: `03_manage_pre_crs.py`
+* **Qué hace:** Inyecta, actualiza o elimina reglas personalizadas ModSecurity (`SecRule`) dentro del grupo prioritario `00_Emergency_Virtual_Patching` (`index: 0` de `pre_crs_groups`).
+* **Argumentos:**
+  * `action`: Posicional obligatorio (`add` o `delete`).
+  * `--id <rule_id>`: ID numérico de la regla (ej. `100099`).
+  * `--name <nombre>`: Nombre descriptivo de la regla (para `add`).
+  * `--rule '<SecRule...>'`: Directiva ModSecurity completa (para `add`).
+  * `--mode`: `WAF_MODE_ENFORCEMENT` (por defecto) o `WAF_MODE_DETECTION_ONLY`.
+  * `--filter <texto>`: Aplicar solo a las políticas que coincidan con el filtro.
+  * `--dry-run`: Simula sin aplicar cambios.
+* **Ejemplo:** `python 03_manage_pre_crs.py add --id 100099 --name "CVE_Log4j" --rule 'SecRule REQUEST_HEADERS "@rx (?i:jndi:ldap)" "id:100099,phase:1,deny,status:403"' --dry-run`
+
+```python
+# 03_manage_pre_crs.py
+import argparse
+from avi_client import get_session, filter_policies, backup_policy
+
+GROUP_NAME = "00_Emergency_Virtual_Patching"
+
+def manage_pre_crs(action, rule_id, rule_name=None, sec_rule=None, mode="WAF_MODE_ENFORCEMENT", policy_filter=None, dry_run=False):
+    api = get_session()
+    policies = filter_policies(api, policy_filter)
+
+    for p in policies:
+        pre_groups = p.get("pre_crs_groups", [])
+        target_group = next((g for g in pre_groups if g["name"] == GROUP_NAME), None)
+        changed = False
+
+        if action == "add":
+            if not target_group:
+                for idx, g in enumerate(pre_groups):
+                    g["index"] = idx + 1
+                target_group = {"index": 0, "name": GROUP_NAME, "enable": True, "rules": []}
+                pre_groups.insert(0, target_group)
+
+            rules = target_group.setdefault("rules", [])
+            existing = next((r for r in rules if str(r.get("rule_id")) == str(rule_id)), None)
+            rule_payload = {
+                "name": rule_name or f"Custom_{rule_id}",
+                "rule_id": str(rule_id),
+                "enable": True,
+                "mode": mode,
+                "rule": sec_rule,
+                "is_sensitive": False
+            }
+            if existing:
+                existing.update(rule_payload)
+            else:
+                rule_payload["index"] = len(rules) + 1
+                rules.append(rule_payload)
+            p["pre_crs_groups"] = pre_groups
+            changed = True
+
+        elif action == "delete" and target_group:
+            orig_len = len(target_group.get("rules", []))
+            target_group["rules"] = [r for r in target_group.get("rules", []) if str(r.get("rule_id")) != str(rule_id)]
+            if len(target_group["rules"]) < orig_len:
+                for idx, r in enumerate(target_group["rules"]):
+                    r["index"] = idx + 1
+                changed = True
+
+        if not changed:
+            continue
+
+        if dry_run:
+            print(f"[DRY-RUN] Acción '{action}' para regla {rule_id} en política '{p['name']}'")
+            continue
+
+        backup_policy(p)
+        resp = api.put(f"wafpolicy/{p['uuid']}", data=p)
+        print(f"[{'+' if resp.status_code == 200 else '!'}] '{p['name']}' -> HTTP {resp.status_code}")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Añade o elimina reglas Pre-CRS en tus políticas WAF")
+    parser.add_argument("action", choices=["add", "delete"], help="Añadir/actualizar o borrar la regla")
+    parser.add_argument("--id", required=True, help="ID numérico de la regla (ej. 100099)")
+    parser.add_argument("--name", help="Nombre de la regla (requerido para 'add')")
+    parser.add_argument("--rule", help="Cadena SecRule de ModSecurity (requerida para 'add')")
+    parser.add_argument("--mode", default="WAF_MODE_ENFORCEMENT", choices=["WAF_MODE_ENFORCEMENT", "WAF_MODE_DETECTION_ONLY"])
+    parser.add_argument("--filter", help="Aplicar solo a políticas cuyo nombre contenga este texto")
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args()
+    manage_pre_crs(args.action, args.id, args.name, args.rule, args.mode, args.filter, args.dry_run)
+```
+
+---
+
+### 4.5. Gestión de Firmas y Grupos CRS (Soporta `POLICY_MODE`): `04_manage_crs_signatures.py`
+* **Qué hace:** Habilita/deshabilita y cambia el modo (`WAF_MODE_ENFORCEMENT`, `WAF_MODE_DETECTION_ONLY` o `POLICY_MODE`) tanto a reglas individuales como a todas las firmas de un grupo CRS completo en arquitecturas `crs_groups` y `crs_overrides`.
+* **Argumentos:**
+  * `--list-groups`: Lista en pantalla los nombres exactos de todos los grupos CRS del controlador.
+  * `--groups <g1> <g2>`: Nombres de los grupos CRS completos a modificar.
+  * `--rules <r1> <r2>`: IDs de las firmas individuales a modificar (ej. `942100 932100`).
+  * `--disable`: Desactiva las reglas o grupos indicados.
+  * `--mode`: `WAF_MODE_ENFORCEMENT`, `WAF_MODE_DETECTION_ONLY` o `POLICY_MODE` (elimina el override de modo para que herede el de la política).
+  * `--filter <texto>`: Filtra por nombre de política.
+  * `--dry-run`: Simula sin guardar cambios.
+* **Ejemplo:** `python 04_manage_crs_signatures.py --groups CRS_942_Application_Attack_SQLi --mode WAF_MODE_ENFORCEMENT`
+
+```python
+# 04_manage_crs_signatures.py
+import argparse
+from avi_client import get_session, filter_policies, backup_policy
+
+def list_crs_groups(policy_filter=None):
+    """Lista los nombres exactos de los grupos CRS disponibles en las políticas"""
+    api = get_session()
+    policies = filter_policies(api, policy_filter)
+    if not policies:
+        print("[-] No se encontraron políticas.")
+        return
+
+    p = policies[0]
+    print(f"[*] Grupos CRS disponibles (basado en la política '{p['name']}'):")
+    if p.get("crs_groups"):
+        for g in p["crs_groups"]:
+            print(f"  • {g['name']} ({len(g.get('rules', []))} reglas)")
+    elif p.get("waf_crs_ref"):
+        crs_uuid = p["waf_crs_ref"].split("/")[-1]
+        crs_catalog = api.get(f"wafcrs/{crs_uuid}").json()
+        for g in crs_catalog.get("groups", []):
+            print(f"  • {g['name']} ({len(g.get('rules', []))} reglas)")
+
+def update_crs_signatures(groups=None, rules=None, enable=True, mode="WAF_MODE_ENFORCEMENT", policy_filter=None, dry_run=False):
+    api = get_session()
+    policies = filter_policies(api, policy_filter)
+    target_groups = set(groups or [])
+    target_rules = set(str(r) for r in (rules or []))
+    crs_cache = {}
+
+    for p in policies:
+        changed = False
+
+        if p.get("crs_groups"):
+            for g in p["crs_groups"]:
+                if g["name"] in target_groups:
+                    g["enable"] = enable
+                    for r in g.get("rules", []):
+                        r["enable"] = enable
+                        if mode == "POLICY_MODE":
+                            r.pop("mode", None)
+                        else:
+                            r["mode"] = mode
+                    changed = True
+                    print(f"  [*] '{p['name']}' -> Grupo '{g['name']}' pasado a {mode} (Enable={enable})")
+
+                for r in g.get("rules", []):
+                    if str(r.get("rule_id")) in target_rules:
+                        if enable:
+                            g["enable"] = True
+                        r["enable"] = enable
+                        if mode == "POLICY_MODE":
+                            r.pop("mode", None)
+                        else:
+                            r["mode"] = mode
+                        changed = True
+                        print(f"  [*] '{p['name']}' -> Regla {r['rule_id']} pasada a {mode} (Enable={enable})")
+
+        else:
+            if not p.get("waf_crs_ref"):
+                continue
+
+            crs_uuid = p["waf_crs_ref"].split("/")[-1]
+            if crs_uuid not in crs_cache:
+                crs_cache[crs_uuid] = api.get(f"wafcrs/{crs_uuid}").json()
+
+            crs_catalog = crs_cache[crs_uuid]
+            overrides = p.setdefault("crs_overrides", [])
+
+            for cg in crs_catalog.get("groups", []):
+                g_name = cg["name"]
+                is_target_group = g_name in target_groups
+
+                if is_target_group:
+                    rules_to_override = [str(r["rule_id"]) for r in cg.get("rules", [])]
+                else:
+                    rules_to_override = [
+                        str(r["rule_id"]) for r in cg.get("rules", [])
+                        if str(r.get("rule_id")) in target_rules
+                    ]
+
+                if not is_target_group and not rules_to_override:
+                    continue
+
+                ov = next((o for o in overrides if o.get("name") == g_name), None)
+                if not ov:
+                    if mode == "POLICY_MODE" and enable:
+                        continue
+                    ov = {"name": g_name, "rule_overrides": []}
+                    overrides.append(ov)
+
+                if is_target_group:
+                    ov["enable"] = enable
+                elif enable:
+                    ov["enable"] = True
+
+                r_ovs = ov.setdefault("rule_overrides", [])
+                for rid in rules_to_override:
+                    rov = next((x for x in r_ovs if str(x.get("rule_id")) == rid), None)
+
+                    if mode == "POLICY_MODE":
+                        if rov:
+                            rov.pop("mode", None)
+                            rov["enable"] = enable
+                            if enable and not rov.get("exclude_list"):
+                                r_ovs.remove(rov)
+                    else:
+                        if not rov:
+                            rov = {"rule_id": rid}
+                            r_ovs.append(rov)
+                        rov["enable"] = enable
+                        rov["mode"] = mode
+
+                changed = True
+                print(f"  [*] '{p['name']}' -> Grupo '{g_name}': {len(rules_to_override)} firmas ajustadas a {mode} (Enable={enable})")
+
+        if not changed:
+            print(f"[-] '{p['name']}': Sin cambios necesarios.")
+            continue
+
+        if dry_run:
+            print(f"[DRY-RUN] Cambios preparados en '{p['name']}'")
+            continue
+
+        bkp = backup_policy(p)
+        resp = api.put(f"wafpolicy/{p['uuid']}", data=p)
+        if resp.status_code == 200:
+            print(f"[+] Política '{p['name']}' actualizada -> HTTP 200 (Backup: {bkp})")
+        else:
+            print(f"[!] Error en '{p['name']}': HTTP {resp.status_code} - {resp.text}")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Modifica estado y modo de grupos o firmas CRS")
+    parser.add_argument("--list-groups", action="store_true", help="Lista los nombres exactos de los grupos CRS y sale")
+    parser.add_argument("--groups", nargs="+", help="Nombres de los grupos CRS")
+    parser.add_argument("--rules", nargs="+", help="IDs de las reglas CRS")
+    parser.add_argument("--disable", action="store_true", help="Deshabilitar en lugar de habilitar")
+    parser.add_argument(
+        "--mode",
+        default="WAF_MODE_ENFORCEMENT",
+        choices=["WAF_MODE_ENFORCEMENT", "WAF_MODE_DETECTION_ONLY", "POLICY_MODE"],
+        help="Modo de las firmas (usa POLICY_MODE para devolverlas al modo que hereden de la política)"
+    )
+    parser.add_argument("--filter", help="Filtrar por nombre de política")
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args()
+
+    if args.list_groups:
+        list_crs_groups(args.filter)
+    else:
+        update_crs_signatures(args.groups, args.rules, not args.disable, args.mode, args.filter, args.dry_run)
+```
+
+---
+
+### 4.6. Cambio de Modo Global y Paranoia: `05_set_policy_mode.py`
+* **Qué hace:** Cambia el modo global de la política (`WAF_MODE_ENFORCEMENT` / `WAF_MODE_DETECTION_ONLY`), el `paranoia_level` y el flag `allow_mode_delegation`.
+* **Argumentos:** `--mode`, `--paranoia`, `--enable-delegation`, `--filter`, `--dry-run`.
+
+```python
+# 05_set_policy_mode.py
+import argparse
+from avi_client import get_session, filter_policies, backup_policy
+
+def set_policy_state(mode=None, paranoia=None, delegation=None, policy_filter=None, dry_run=False):
+    api = get_session()
+    policies = filter_policies(api, policy_filter)
+
+    for p in policies:
+        if mode:
+            p["mode"] = mode
+        if paranoia:
+            p["paranoia_level"] = paranoia
+        if delegation is not None:
+            p["allow_mode_delegation"] = delegation
+
+        if dry_run:
+            print(f"[DRY-RUN] '{p['name']}' -> Mode: {p['mode']}, Paranoia: {p['paranoia_level']}, Delegation: {p.get('allow_mode_delegation')}")
+            continue
+
+        backup_policy(p)
+        resp = api.put(f"wafpolicy/{p['uuid']}", data=p)
+        print(f"[+] '{p['name']}' actualizada -> HTTP {resp.status_code}")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Modifica el estado global de las políticas WAF")
+    parser.add_argument("--mode", choices=["WAF_MODE_ENFORCEMENT", "WAF_MODE_DETECTION_ONLY"])
+    parser.add_argument("--paranoia", choices=["WAF_PARANOIA_LEVEL_LOW", "WAF_PARANOIA_LEVEL_MEDIUM", "WAF_PARANOIA_LEVEL_HIGH", "WAF_PARANOIA_LEVEL_EXTREME"])
+    parser.add_argument("--enable-delegation", action="store_true", help="Permite que reglas en Enforcement bloqueen aunque la política esté en Detection")
+    parser.add_argument("--filter", help="Filtrar por nombre de política")
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args()
+    deleg = True if args.enable_delegation else None
+    set_policy_state(args.mode, args.paranoia, deleg, args.filter, args.dry_run)
+```
+
+---
+
+### 4.7. Rollback desde Backup JSON: `06_rollback_policy.py`
+* **Qué hace:** Restaura en 1 segundo una política WAF a partir del archivo JSON generado en `backups/`.
+* **Uso:** `python 06_rollback_policy.py backups/Mi_Politica_20261114_150000.json`
+
+```python
+# 06_rollback_policy.py
+import json
+import sys
+from avi_client import get_session
+
+def rollback(backup_file):
+    api = get_session()
+    with open(backup_file, "r", encoding="utf-8") as f:
+        policy_data = json.load(f)
+
+    uuid = policy_data["uuid"]
+    name = policy_data["name"]
+    resp = api.put(f"wafpolicy/{uuid}", data=policy_data)
+    if resp.status_code == 200:
+        print(f"[+] Rollback completado con éxito para '{name}' desde {backup_file}")
+    else:
+        print(f"[!] Error en rollback ({resp.status_code}): {resp.text}")
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Uso: python 06_rollback_policy.py backups/<archivo_backup.json>")
+        sys.exit(1)
+    rollback(sys.argv[1])
+```
+
+---
+
+## 5. Bloque 2: F5 BIG-IP ASM / Advanced WAF
+
+### 5.1. Módulo Base F5: `f5_client.py`
+Gestiona el token `X-F5-Auth-Token` en `/mgmt/shared/authn/login`, los snapshots locales en `./backups_f5/` y la ejecución de la tarea obligatoria `apply-policy` tras cada cambio.
+
+```python
+# f5_client.py
+import os
+import json
+import time
+import urllib3
+import requests
+from datetime import datetime
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+F5_HOST = os.getenv("F5_HOST", "10.0.0.20")
+F5_USER = os.getenv("F5_USER", "admin")
+F5_PASS = os.getenv("F5_PASS", "tu_password")
+
+class F5AsmClient:
+    def __init__(self):
+        self.base_url = f"https://{F5_HOST}/mgmt"
+        self.session = requests.Session()
+        self.session.verify = False
+        self.token = None
+        self._login()
+
+    def _login(self):
+        url = f"{self.base_url}/shared/authn/login"
+        payload = {"username": F5_USER, "password": F5_PASS, "loginProviderName": "tmos"}
+        r = self.session.post(url, json=payload, timeout=30)
+        r.raise_for_status()
+        self.token = r.json()["token"]["token"]
+        self.session.headers.update({"X-F5-Auth-Token": self.token, "Content-Type": "application/json"})
+
+    def get(self, endpoint, params=None):
+        r = self.session.get(f"{self.base_url}/{endpoint.lstrip('/')}", params=params, timeout=60)
+        r.raise_for_status()
+        return r.json()
+
+    def post(self, endpoint, data):
+        r = self.session.post(f"{self.base_url}/{endpoint.lstrip('/')}", json=data, timeout=60)
+        r.raise_for_status()
+        return r.json()
+
+    def patch(self, endpoint, data):
+        r = self.session.patch(f"{self.base_url}/{endpoint.lstrip('/')}", json=data, timeout=60)
+        r.raise_for_status()
+        return r.json()
+
+    def get_policies(self, name_filter=None):
+        items = self.get("tm/asm/policies").get("items", [])
+        if name_filter:
+            return [p for p in items if name_filter.lower() in p["name"].lower()]
+        return items
+
+    def backup_policy_summary(self, policy_id, policy_name):
+        os.makedirs("backups_f5", exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        pol_data = self.get(f"tm/asm/policies/{policy_id}")
+        sigs_overridden = self.get(
+            f"tm/asm/policies/{policy_id}/signatures",
+            params={"$filter": "performStaging eq false or enabled eq false", "$select": "id,signature/signatureId,enabled,performStaging"}
+        ).get("items", [])
+        w_ips = self.get(f"tm/asm/policies/{policy_id}/whitelist-ips").get("items", [])
+
+        snapshot = {"policy": pol_data, "signature_states": sigs_overridden, "whitelist_ips": w_ips}
+        safe_name = policy_name.replace("/", "_")
+        fname = f"backups_f5/{safe_name}_{ts}.json"
+        with open(fname, "w", encoding="utf-8") as f:
+            json.dump(snapshot, f, indent=2)
+        return fname
+
+    def apply_policy(self, policy_id, policy_name):
+        task = self.post("tm/asm/tasks/apply-policy", {
+            "policyReference": {"link": f"https://localhost/mgmt/tm/asm/policies/{policy_id}"}
+        })
+        task_id = task["id"]
+        for _ in range(30):
+            status = self.get(f"tm/asm/tasks/apply-policy/{task_id}").get("status")
+            if status == "COMPLETED":
+                print(f"  [+] Apply Policy completado en '{policy_name}'")
+                return True
+            if status == "FAILURE":
+                print(f"  [!] Fallo al aplicar política en '{policy_name}'")
+                return False
+            time.sleep(2)
+        return False
+```
+
+---
+
+### 5.2. Mapeo `ASM Policy -> LTM Virtual Server -> Pool -> Nodos`: `f5_01_map_backends.py`
+* **Qué hace:** Muestra qué Virtual Servers LTM tienen asociada cada política ASM, a qué Pool apuntan y cuáles son las IPs, puertos y estado de los servidores backend.
+* **Argumentos:** `--filter <texto>`.
+
+```python
+# f5_01_map_backends.py
+import argparse
+from f5_client import F5AsmClient
+
+def map_f5_inventory(policy_filter=None):
+    f5 = F5AsmClient()
+    asm_policies = f5.get_policies(policy_filter)
+    vservers = f5.get("tm/ltm/virtual", params={"expandSubcollections": "true"}).get("items", [])
+    pools = {p["fullPath"]: p for p in f5.get("tm/ltm/pool", params={"expandSubcollections": "true"}).get("items", [])}
+
+    for pol in asm_policies:
+        p_name = pol["name"]
+        p_path = pol["fullPath"]
+        v_names = pol.get("virtualServers", [])
+
+        print(f"\n============================================================")
+        print(f"ASM POLICY: {p_path} | Modo: {pol.get('enforcementMode').upper()}")
+        print(f"============================================================")
+
+        matched_vs = [vs for vs in vservers if vs["fullPath"] in v_names or p_name in str(vs.get("policiesReference", ""))]
+        if not matched_vs:
+            print("  [!] Sin Virtual Servers LTM asociados.")
+            continue
+
+        for vs in matched_vs:
+            vs_dest = vs.get("destination", "N/A")
+            pool_path = vs.get("pool")
+            print(f"  └── Virtual Server: {vs['fullPath']} (VIP: {vs_dest})")
+            if not pool_path or pool_path not in pools:
+                print("       └── [Sin Pool directo asignado]")
+                continue
+            pool_obj = pools[pool_path]
+            members = pool_obj.get("membersReference", {}).get("items", [])
+            print(f"       └── Pool: {pool_path} ({len(members)} nodos)")
+            for m in members:
+                print(f"            • Backend: {m.get('address')}:{m.get('name').split(':')[-1]} ({m.get('name')}) [Estado: {m.get('state', 'unknown').upper()}]")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Mapea Políticas F5 ASM -> Virtual Servers -> Pools -> Nodos Backend")
+    parser.add_argument("--filter", help="Filtrar por nombre de política ASM")
+    args = parser.parse_args()
+    map_f5_inventory(args.filter)
+```
+
+---
+
+### 5.3. Auditoría de Políticas, Firmas en Staging y Excepciones: `f5_02_audit_policy.py`
+* **Qué hace:** Lista los *Signature Sets*, el recuento y detalle de firmas deshabilitadas o en *Staging*, las IPs en *Whitelist* y las firmas excluidas por parámetro (`ARGS`) o por URL (`URI Path`).
+* **Argumentos:** `--filter <texto>`, `--details`.
+
+```python
+# f5_02_audit_policy.py
+import argparse
+from f5_client import F5AsmClient
+
+def audit_f5_policies(policy_filter=None, details=False):
+    f5 = F5AsmClient()
+    policies = f5.get_policies(policy_filter)
+
+    for p in policies:
+        pid = p["id"]
+        print(f"\n======================================================================")
+        print(f"POLÍTICA ASM: {p['fullPath']} (ID: {pid})")
+        print(f"Enforcement Mode: {p.get('enforcementMode')} | Activa: {p.get('active')}")
+        print(f"======================================================================")
+
+        sig_sets = f5.get(f"tm/asm/policies/{pid}/signature-sets").get("items", [])
+        print(f"\n  [Signature Sets ({len(sig_sets)})]:")
+        for ss in sig_sets:
+            s_name = ss.get("signatureSetReference", {}).get("name", "N/A")
+            print(f"    • {s_name} -> Block: {ss.get('block')} | Alarm: {ss.get('alarm')} | Learn: {ss.get('learn')}")
+
+        sigs = f5.get(
+            f"tm/asm/policies/{pid}/signatures",
+            params={"$filter": "enabled eq false or performStaging eq true"}
+        ).get("items", [])
+        disabled_sigs = [s for s in sigs if not s.get("enabled", True)]
+        staging_sigs = [s for s in sigs if s.get("performStaging", False) and s.get("enabled", True)]
+        print(f"\n  [Estado de Firmas]: {len(disabled_sigs)} Deshabilitadas | {len(staging_sigs)} en Staging (Detection)")
+
+        if details:
+            for s in disabled_sigs[:25]:
+                sig_ref = s.get("signature", {})
+                print(f"    - [DISABLED] SigID {sig_ref.get('signatureId')}: {sig_ref.get('name')}")
+
+        w_ips = f5.get(f"tm/asm/policies/{pid}/whitelist-ips").get("items", [])
+        print(f"\n  [IP Whitelist / Excepciones de Red]: {len(w_ips)}")
+        for wip in w_ips:
+            print(f"    • {wip.get('ipAddress')}/{wip.get('ipMask')} | NeverBlock: {wip.get('neverBlockRequests')} | Desc: {wip.get('description', '')}")
+
+        if details:
+            params = f5.get(f"tm/asm/policies/{pid}/parameters", params={"expandSubcollections": "true"}).get("items", [])
+            overridden_params = [pr for pr in params if pr.get("signatureOverridesReference", {}).get("items")]
+            print(f"\n  [Excepciones en Parámetros (ARGS)]: {len(overridden_params)}")
+            for pr in overridden_params:
+                ov_list = pr["signatureOverridesReference"]["items"]
+                sig_ids = [str(o.get("signatureReference", {}).get("signatureId")) for o in ov_list]
+                print(f"    • Parámetro '{pr.get('name')}' (Level: {pr.get('level')}) -> Excluye SigIDs: {', '.join(sig_ids)}")
+
+            urls = f5.get(f"tm/asm/policies/{pid}/urls", params={"expandSubcollections": "true"}).get("items", [])
+            overridden_urls = [u for u in urls if u.get("signatureOverridesReference", {}).get("items")]
+            print(f"\n  [Excepciones en URLs (URI Path)]: {len(overridden_urls)}")
+            for u in overridden_urls:
+                ov_list = u["signatureOverridesReference"]["items"]
+                sig_ids = [str(o.get("signatureReference", {}).get("signatureId")) for o in ov_list]
+                print(f"    • URL '{u.get('name')}' ({u.get('protocol')}) -> Excluye SigIDs: {', '.join(sig_ids)}")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Audita Signature Sets, Whitelists y Overrides de URL/Parámetros en F5 ASM")
+    parser.add_argument("--filter", help="Filtrar por nombre de política")
+    parser.add_argument("--details", action="store_true", help="Mostrar el detalle de firmas excluidas por URL y Parámetro")
+    args = parser.parse_args()
+    audit_f5_policies(args.filter, args.details)
+```
+
+---
+
+### 5.4. Activación y Enforcement de Firmas y Signature Sets: `f5_03_enforce_signatures.py`
+* **Qué hace:** Pasa firmas específicas (`--sigs`), conjuntos de firmas (`--sets`) o políticas enteras (`--policy-mode`) a modo bloqueo (`performStaging=False`, `enabled=True`) y ejecuta `apply-policy`.
+* **Argumentos:** `--sigs <id1> <id2>`, `--sets <nombre1>`, `--policy-mode [blocking|transparent]`, `--staging`, `--disable`, `--filter`, `--dry-run`.
+
+```python
+# f5_03_enforce_signatures.py
+import argparse
+from f5_client import F5AsmClient
+
+def manage_f5_enforcement(sig_ids=None, sig_sets=None, global_mode=None, staging=False, disable=False, policy_filter=None, dry_run=False):
+    f5 = F5AsmClient()
+    policies = f5.get_policies(policy_filter)
+    target_sigs = [str(s) for s in (sig_ids or [])]
+    target_sets = [s.lower() for s in (sig_sets or [])]
+
+    for p in policies:
+        pid = p["id"]
+        pname = p["fullPath"]
+        changed = False
+
+        if not dry_run:
+            bkp = f5.backup_policy_summary(pid, p["name"])
+            print(f"[*] Backup previo guardado en {bkp}")
+
+        if global_mode:
+            if dry_run:
+                print(f"[DRY-RUN] '{pname}' pasaría a enforcementMode={global_mode}")
+            else:
+                f5.patch(f"tm/asm/policies/{pid}", {"enforcementMode": global_mode})
+                changed = True
+
+        if target_sets:
+            sets_in_pol = f5.get(f"tm/asm/policies/{pid}/signature-sets").get("items", [])
+            for ss in sets_in_pol:
+                ss_name = ss.get("signatureSetReference", {}).get("name", "")
+                if any(t in ss_name.lower() for t in target_sets):
+                    if dry_run:
+                        print(f"[DRY-RUN] '{pname}' -> Signature Set '{ss_name}' block={not staging}")
+                    else:
+                        f5.patch(f"tm/asm/policies/{pid}/signature-sets/{ss['id']}", {"block": not staging, "alarm": True})
+                        changed = True
+
+        for pub_sig_id in target_sigs:
+            found = f5.get(
+                f"tm/asm/policies/{pid}/signatures",
+                params={"$filter": f"signature/signatureId eq {pub_sig_id}"}
+            ).get("items", [])
+            if not found:
+                print(f"  [-] Firma {pub_sig_id} no encontrada en '{pname}'")
+                continue
+
+            internal_sig_id = found[0]["id"]
+            payload = {"enabled": not disable, "performStaging": staging}
+            if dry_run:
+                print(f"[DRY-RUN] '{pname}' -> Firma {pub_sig_id} actualizaría a {payload}")
+            else:
+                f5.patch(f"tm/asm/policies/{pid}/signatures/{internal_sig_id}", payload)
+                print(f"  [+] '{pname}' -> Firma {pub_sig_id} actualizada: Enabled={not disable}, Staging={staging}")
+                changed = True
+
+        if changed and not dry_run:
+            f5.apply_policy(pid, pname)
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Pasa firmas, Signature Sets o políticas F5 ASM a Enforcement (Blocking)")
+    parser.add_argument("--sigs", nargs="+", help="IDs públicos de firmas ASM (ej. 200001475 200004123)")
+    parser.add_argument("--sets", nargs="+", help="Nombres de Signature Sets (ej. 'SQL Injection' 'Command Execution')")
+    parser.add_argument("--policy-mode", choices=["blocking", "transparent"], help="Cambiar el modo global de la política")
+    parser.add_argument("--staging", action="store_true", help="Poner en modo Staging (Detection) en lugar de Enforcement")
+    parser.add_argument("--disable", action="store_true", help="Deshabilitar las firmas indicadas")
+    parser.add_argument("--filter", help="Filtrar por nombre de política")
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args()
+    manage_f5_enforcement(args.sigs, args.sets, args.policy_mode, args.staging, args.disable, args.filter, args.dry_run)
+```
+
+---
+
+### 5.5. Creación de Excepciones (URL / Parámetro / IP Whitelist): `f5_04_exceptions_and_patching.py`
+* **Qué hace:** Excluye un `signatureId` sobre un parámetro concreto (`--param`) o sobre una URL (`--url`), o añade una IP a la lista blanca (`--whitelist-ip`), aplicando la política automáticamente.
+* **Argumentos:** `--filter`, `--sig <id>`, `--param <nombre>`, `--url <path>`, `--whitelist-ip <ip>`, `--dry-run`.
+
+```python
+# f5_04_exceptions_and_patching.py
+import argparse
+from f5_client import F5AsmClient
+
+def add_f5_exception(policy_filter, sig_id=None, param_name=None, url_path=None, whitelist_ip=None, netmask="255.255.255.255", dry_run=False):
+    f5 = F5AsmClient()
+    policies = f5.get_policies(policy_filter)
+
+    for p in policies:
+        pid = p["id"]
+        pname = p["fullPath"]
+
+        if whitelist_ip:
+            if dry_run:
+                print(f"[DRY-RUN] Añadiría IP {whitelist_ip}/{netmask} a Whitelist en '{pname}'")
+            else:
+                f5.post(f"tm/asm/policies/{pid}/whitelist-ips", {
+                    "ipAddress": whitelist_ip,
+                    "ipMask": netmask,
+                    "neverBlockRequests": True,
+                    "description": "Added via SecOps Automation"
+                })
+                f5.apply_policy(pid, pname)
+
+        if sig_id and (param_name or url_path):
+            global_sig = f5.get("tm/asm/signatures", params={"$filter": f"signatureId eq {sig_id}"}).get("items", [])
+            if not global_sig:
+                print(f"[!] No existe la firma global {sig_id} en el F5.")
+                return
+            sig_link = global_sig[0]["selfLink"]
+
+            if param_name:
+                if dry_run:
+                    print(f"[DRY-RUN] Excluiría firma {sig_id} del parámetro '{param_name}' en '{pname}'")
+                else:
+                    existing_p = f5.get(f"tm/asm/policies/{pid}/parameters", params={"$filter": f"name eq '{param_name}'"}).get("items", [])
+                    if existing_p:
+                        param_id = existing_p[0]["id"]
+                    else:
+                        created = f5.post(f"tm/asm/policies/{pid}/parameters", {"name": param_name, "level": "global", "performStaging": False})
+                        param_id = created["id"]
+
+                    f5.post(f"tm/asm/policies/{pid}/parameters/{param_id}/signature-overrides", {
+                        "enabled": False,
+                        "signatureReference": {"link": sig_link}
+                    })
+                    print(f"[+] Excepción creada: Firma {sig_id} desactivada en parámetro '{param_name}' ({pname})")
+                    f5.apply_policy(pid, pname)
+
+            if url_path:
+                if dry_run:
+                    print(f"[DRY-RUN] Excluiría firma {sig_id} de la URL '{url_path}' en '{pname}'")
+                else:
+                    existing_u = f5.get(f"tm/asm/policies/{pid}/urls", params={"$filter": f"name eq '{url_path}'"}).get("items", [])
+                    if existing_u:
+                        url_id = existing_u[0]["id"]
+                    else:
+                        created_u = f5.post(f"tm/asm/policies/{pid}/urls", {"name": url_path, "protocol": "https", "performStaging": False})
+                        url_id = created_u["id"]
+
+                    f5.post(f"tm/asm/policies/{pid}/urls/{url_id}/signature-overrides", {
+                        "enabled": False,
+                        "signatureReference": {"link": sig_link}
+                    })
+                    print(f"[+] Excepción creada: Firma {sig_id} desactivada en URL '{url_path}' ({pname})")
+                    f5.apply_policy(pid, pname)
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Crea excepciones de falsos positivos (URL, Parámetro, IP) en F5 ASM")
+    parser.add_argument("--filter", help="Filtrar por nombre de política ASM")
+    parser.add_argument("--sig", type=int, help="ID público de la firma a excluir (ej. 200001475)")
+    parser.add_argument("--param", help="Nombre del parámetro donde excluir la firma (ej. xml_payload)")
+    parser.add_argument("--url", help="Ruta URL donde excluir la firma (ej. /api/v1/login)")
+    parser.add_argument("--whitelist-ip", help="IP origen a meter en lista blanca")
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args()
+    add_f5_exception(args.filter, args.sig, args.param, args.url, args.whitelist_ip, dry_run=args.dry_run)
+```
+
+---
+
+## 6. Bloque 3: Akamai Application Security (AppSec API v1)
+
+### 6.1. Módulo Base Akamai: `akamai_client.py`
+Gestiona la firma EdgeGrid, exporta backups completos de la configuración en `./backups_akamai/` y clona automáticamente la última versión activa en `PRODUCTION` cuando es necesario editar una configuración inmutable.
+
+```python
+# akamai_client.py
+import os
+import json
+import requests
+from datetime import datetime
+from urllib.parse import urljoin
+from akamai.edgegrid import EdgeGridAuth, EdgeRc
+
+EDGERC_PATH = os.getenv("AKAMAI_EDGERC", os.path.expanduser("~/.edgerc"))
+EDGERC_SECTION = os.getenv("AKAMAI_SECTION", "default")
+
+class AkamaiAppSecClient:
+    def __init__(self):
+        self.session = requests.Session()
+        if os.path.exists(EDGERC_PATH):
+            edgerc = EdgeRc(EDGERC_PATH)
+            self.base_url = f"https://{edgerc.get(EDGERC_SECTION, 'host')}"
+            self.session.auth = EdgeGridAuth.from_edgerc(edgerc, EDGERC_SECTION)
+        else:
+            self.base_url = f"https://{os.getenv('AKAMAI_HOST', 'akab-xxxx.luna.akamaiapis.net')}"
+            self.session.auth = EdgeGridAuth(
+                client_token=os.getenv("AKAMAI_CLIENT_TOKEN", ""),
+                client_secret=os.getenv("AKAMAI_CLIENT_SECRET", ""),
+                access_token=os.getenv("AKAMAI_ACCESS_TOKEN", "")
+            )
+        self.session.headers.update({"Content-Type": "application/json", "Accept": "application/json"})
+
+    def get(self, path, params=None):
+        r = self.session.get(urljoin(self.base_url, path), params=params, timeout=60)
+        r.raise_for_status()
+        return r.json()
+
+    def put(self, path, data):
+        r = self.session.put(urljoin(self.base_url, path), json=data, timeout=60)
+        r.raise_for_status()
+        return r.json() if r.text else {}
+
+    def post(self, path, data):
+        r = self.session.post(urljoin(self.base_url, path), json=data, timeout=60)
+        r.raise_for_status()
+        return r.json() if r.text else {}
+
+    def get_editable_or_clone_version(self, config_id, base_env="PRODUCTION"):
+        cfg = self.get(f"/appsec/v1/configs/{config_id}")
+        latest_v = cfg.get("latestVersion", 1)
+        prod_v = cfg.get("productionVersion", latest_v)
+        stag_v = cfg.get("stagingVersion", latest_v)
+
+        if latest_v != prod_v and latest_v != stag_v:
+            return latest_v
+
+        clone_from = prod_v if base_env == "PRODUCTION" and prod_v else latest_v
+        print(f"[*] Clonando versión {clone_from} de Config {config_id} para crear nueva versión editable...")
+        res = self.post(f"/appsec/v1/configs/{config_id}/versions", {
+            "createFromVersion": clone_from,
+            "ruleUpdate": False
+        })
+        return res["version"]
+
+    def backup_config_version(self, config_id, version):
+        os.makedirs("backups_akamai", exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        export_data = self.get(f"/appsec/v1/export/configs/{config_id}/versions/{version}")
+        fname = f"backups_akamai/cfg_{config_id}_v{version}_{ts}.json"
+        with open(fname, "w", encoding="utf-8") as f:
+            json.dump(export_data, f, indent=2)
+        return fname
+```
+
+---
+
+### 6.2. Inventario y Auditoría de Configuraciones, Hostnames, WAF, DDoS y Bot: `akamai_01_inventory_audit.py`
+* **Qué hace:** Lista las configuraciones de seguridad, versiones activas en Staging/Prod, dominios cubiertos, estado de módulos (WAF, Rate Controls/Anti-DDoS, IP/Geo Firewall, Bot Management, SlowPost), modos de *Attack Groups* y excepciones en reglas ASE.
+* **Argumentos:** `--filter <texto>`, `--details`.
+
+```python
+# akamai_01_inventory_audit.py
+import argparse
+from akamai_client import AkamaiAppSecClient
+
+def audit_akamai_appsec(config_filter=None, details=False):
+    ak = AkamaiAppSecClient()
+    configs = ak.get("/appsec/v1/configs").get("configurations", [])
+
+    for c in configs:
+        cid = c["id"]
+        cname = c["name"]
+        if config_filter and config_filter.lower() not in cname.lower():
+            continue
+
+        ver = c.get("productionVersion") or c.get("stagingVersion") or c.get("latestVersion")
+        print(f"\n======================================================================")
+        print(f"AKAMAI CONFIG: {cname} (ID: {cid})")
+        print(f"Versiones -> Production: v{c.get('productionVersion')} | Staging: v{c.get('stagingVersion')} | Latest: v{c.get('latestVersion')}")
+        print(f"======================================================================")
+
+        hosts_resp = ak.get(f"/appsec/v1/configs/{cid}/versions/{ver}/selected-hostnames")
+        hosts = [h["hostname"] for h in hosts_resp.get("hostnameList", [])]
+        print(f"  [Hostnames Protegidos ({len(hosts)})]: {', '.join(hosts[:10])}{'...' if len(hosts) > 10 else ''}")
+
+        policies = ak.get(f"/appsec/v1/configs/{cid}/versions/{ver}/security-policies").get("policies", [])
+        for pol in policies:
+            pid = pol["policyId"]
+            pname = pol["policyName"]
+            print(f"\n  └── Security Policy: {pname} (PolicyID: {pid})")
+
+            prot = ak.get(f"/appsec/v1/configs/{cid}/versions/{ver}/security-policies/{pid}/protections")
+            print(f"       • Controles Activos -> WAF: {prot.get('applyApplicationLayerControls')} | "
+                  f"Rate/DDoS: {prot.get('applyRateControls')} | "
+                  f"IP/Geo FW: {prot.get('applyNetworkLayerControls')} | "
+                  f"BotMan: {prot.get('applyBotmanControls')} | "
+                  f"SlowPost: {prot.get('applySlowPostControls')}")
+
+            ag_list = ak.get(f"/appsec/v1/configs/{cid}/versions/{ver}/security-policies/{pid}/attack-groups").get("attackGroupAction", [])
+            for ag in ag_list:
+                print(f"       • Attack Group [{ag.get('group')}]: Action={ag.get('action').upper()}")
+
+            if details:
+                rate_actions = ak.get(f"/appsec/v1/configs/{cid}/versions/{ver}/security-policies/{pid}/rate-policies").get("ratePolicyActions", [])
+                print(f"       • Rate Policies / Anti-DDoS ({len(rate_actions)}):")
+                for rp in rate_actions:
+                    print(f"          - RatePolicy ID {rp.get('id')}: IPv4 Action={rp.get('ipv4Action')} | IPv6 Action={rp.get('ipv6Action')}")
+
+                rules = ak.get(f"/appsec/v1/configs/{cid}/versions/{ver}/security-policies/{pid}/rules").get("ruleActions", [])
+                overridden_rules = [r for r in rules if r.get("action") != "none" or r.get("conditions") or r.get("exception")]
+                print(f"       • Reglas ASE con Overrides o Excepciones: {len(overridden_rules)}")
+                for r in overridden_rules[:20]:
+                    has_exc = " [CON EXCEPCIÓN]" if r.get("exception") else ""
+                    print(f"          - Rule ID {r.get('id')} -> Action: {r.get('action').upper()}{has_exc}")
+                    if r.get("exception"):
+                        print(f"            Detalle Excepción: {r['exception']}")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Audita Configuraciones, Hostnames, Attack Groups, Anti-DDoS y Excepciones en Akamai AppSec")
+    parser.add_argument("--filter", help="Filtrar por nombre de configuración Akamai")
+    parser.add_argument("--details", action="store_true", help="Mostrar Rate Policies y Excepciones de reglas individuales")
+    args = parser.parse_args()
+    audit_akamai_appsec(args.filter, args.details)
+```
+
+---
+
+### 6.3. Cambio de Modo en Attack Groups, Reglas ASE y Rate Controls: `akamai_02_enforce_rules_groups.py`
+* **Qué hace:** Cambia a `deny`, `alert` o `none` cualquier *Attack Group* (`SQL`, `XSS`, `CMD`, `LFI`, `RFI`), regla ASE individual o *Rate Policy* Anti-DDoS.
+* **Argumentos:** `--config-id <id>`, `--policy-id <id>`, `--groups`, `--rules`, `--rate-policies`, `--action [deny|alert|none]`, `--dry-run`.
+
+```python
+# akamai_02_enforce_rules_groups.py
+import argparse
+from akamai_client import AkamaiAppSecClient
+
+def update_akamai_enforcement(config_id, policy_id=None, groups=None, rules=None, rate_policy_ids=None, action="deny", dry_run=False):
+    ak = AkamaiAppSecClient()
+
+    if dry_run:
+        cfg = ak.get(f"/appsec/v1/configs/{config_id}")
+        ver = cfg.get("productionVersion") or cfg.get("latestVersion")
+        print(f"[DRY-RUN] Simulando sobre Config {config_id} (v{ver}) con acción '{action}'")
+    else:
+        ver = ak.get_editable_or_clone_version(config_id)
+        bkp = ak.backup_config_version(config_id, ver)
+        print(f"[*] Trabajando sobre versión editable v{ver} (Backup: {bkp})")
+
+    policies = ak.get(f"/appsec/v1/configs/{config_id}/versions/{ver}/security-policies").get("policies", [])
+    target_policies = [p for p in policies if not policy_id or p["policyId"] == policy_id]
+
+    for pol in target_policies:
+        pid = pol["policyId"]
+
+        for g_code in (groups or []):
+            if dry_run:
+                print(f"  [DRY-RUN] Policy '{pid}' -> Attack Group '{g_code}' pasaría a action='{action}'")
+            else:
+                ak.put(f"/appsec/v1/configs/{config_id}/versions/{ver}/security-policies/{pid}/attack-groups/{g_code}", {"action": action})
+                print(f"  [+] Policy '{pid}' -> Attack Group '{g_code}' actualizado a '{action}'")
+
+        for r_id in (rules or []):
+            if dry_run:
+                print(f"  [DRY-RUN] Policy '{pid}' -> Rule ID {r_id} pasaría a action='{action}'")
+            else:
+                ak.put(f"/appsec/v1/configs/{config_id}/versions/{ver}/security-policies/{pid}/rules/{r_id}", {"action": action})
+                print(f"  [+] Policy '{pid}' -> Rule ID {r_id} actualizada a '{action}'")
+
+        for rp_id in (rate_policy_ids or []):
+            if dry_run:
+                print(f"  [DRY-RUN] Policy '{pid}' -> Rate Policy {rp_id} pasaría a '{action}'")
+            else:
+                ak.put(f"/appsec/v1/configs/{config_id}/versions/{ver}/security-policies/{pid}/rate-policies/{rp_id}", {"ipv4Action": action, "ipv6Action": action})
+                print(f"  [+] Policy '{pid}' -> Rate Policy {rp_id} actualizada a '{action}'")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Pasa Attack Groups, Reglas ASE o Rate Controls a 'deny' o 'alert' en Akamai")
+    parser.add_argument("--config-id", type=int, required=True, help="ID numérico de la Security Configuration en Akamai")
+    parser.add_argument("--policy-id", help="ID de la política (si se omite, aplica a todas las políticas de esa Config)")
+    parser.add_argument("--groups", nargs="+", help="Códigos de Attack Group (ej. SQL XSS CMD LFI RFI PLATFORM)")
+    parser.add_argument("--rules", nargs="+", type=int, help="IDs de reglas ASE (ej. 942100 950001)")
+    parser.add_argument("--rate-policies", nargs="+", type=int, help="IDs de Rate Policies Anti-DDoS")
+    parser.add_argument("--action", default="deny", choices=["deny", "alert", "none"], help="Acción a configurar")
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args()
+    update_akamai_enforcement(args.config_id, args.policy_id, args.groups, args.rules, args.rate_policies, args.action, args.dry_run)
+```
+
+---
+
+### 6.4. Custom Rules (0-Day Patching), Excepciones y Activación: `akamai_03_custom_rules_and_exceptions.py`
+* **Qué hace:** Dispone de 3 subcomandos:
+  1. `custom-rule`: Crea e inyecta una regla personalizada en modo `deny`.
+  2. `exception`: Añade una excepción de ruta (`pathMatch`) o parámetro (`REQUEST_PARAMS`) a un `rule_id`.
+  3. `activate`: Despliega la versión editable en la red `STAGING` o `PRODUCTION` de Akamai.
+
+```python
+# akamai_03_custom_rules_and_exceptions.py
+import argparse
+from akamai_client import AkamaiAppSecClient
+
+def create_and_enforce_custom_rule(ak, config_id, ver, policy_id, rule_name, path_match, header_name=None, regex_val=None):
+    conditions = [{"type": "pathMatch", "positiveMatch": True, "value": [path_match]}]
+    if header_name and regex_val:
+        conditions.append({
+            "type": "requestHeaderValueMatch",
+            "positiveMatch": True,
+            "name": header_name,
+            "value": [regex_val],
+            "valueWildcard": True,
+            "valueCase": False
+        })
+
+    custom_rule_payload = {
+        "name": rule_name,
+        "description": "Emergency Virtual Patching via SecOps Script",
+        "conditions": conditions
+    }
+    created = ak.post(f"/appsec/v1/configs/{config_id}/custom-rules", custom_rule_payload)
+    c_rule_id = created["id"]
+    print(f"[+] Custom Rule '{rule_name}' creada con ID {c_rule_id}")
+
+    ak.put(f"/appsec/v1/configs/{config_id}/versions/{ver}/security-policies/{policy_id}/custom-rules/{c_rule_id}", {"action": "deny"})
+    print(f"[+] Custom Rule {c_rule_id} activada en modo DENY en la política '{policy_id}'")
+
+def add_rule_exception(ak, config_id, ver, policy_id, rule_id, paths=None, param_names=None):
+    exception_payload = {}
+    if param_names:
+        exception_payload["specificHeaderCookieOrParamNameValue"] = {
+            "names": param_names,
+            "selector": "REQUEST_PARAMS",
+            "wildcard": True
+        }
+    if paths:
+        exception_payload["advancedExceptions"] = {
+            "conditions": [{"type": "pathMatch", "positiveMatch": True, "values": paths}]
+        }
+    ak.put(f"/appsec/v1/configs/{config_id}/versions/{ver}/security-policies/{policy_id}/rules/{rule_id}/condition-exception", exception_payload)
+    print(f"[+] Excepción aplicada en Regla {rule_id} (Política '{policy_id}') para Paths={paths}, Params={param_names}")
+
+def activate_version(ak, config_id, ver, network, emails, note="SecOps Automated Deployment"):
+    payload = {
+        "action": "ACTIVATE",
+        "network": network.upper(),
+        "note": note,
+        "notificationEmails": emails,
+        "activationConfigs": [{"configId": config_id, "configVersion": ver}]
+    }
+    res = ak.post("/appsec/v1/activations", payload)
+    print(f"[+] Activación lanzada en {network.upper()} -> ActivationID: {res.get('activationId')} (Estado: {res.get('status')})")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Parcheo Virtual (Custom Rules), Excepciones y Activación en Akamai AppSec")
+    parser.add_argument("--config-id", type=int, required=True)
+    parser.add_argument("--policy-id", required=True)
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_cr = sub.add_parser("custom-rule", help="Crea e inyecta una Custom Rule en modo DENY")
+    p_cr.add_argument("--name", required=True, help="Nombre de la regla (ej. Block_CVE_2026)")
+    p_cr.add_argument("--path", default="/*", help="URI Path (ej. /api/*)")
+    p_cr.add_argument("--header", help="Nombre de cabecera HTTP a inspeccionar")
+    p_cr.add_argument("--pattern", help="Patrón o comodín a bloquear en la cabecera")
+
+    p_ex = sub.add_parser("exception", help="Añade una excepción de URI o parámetro a un Rule ID")
+    p_ex.add_argument("--rule-id", type=int, required=True, help="ID de la firma ASE (ej. 942100)")
+    p_ex.add_argument("--paths", nargs="+", help="Rutas a excluir (ej. /api/v1/checkout)")
+    p_ex.add_argument("--params", nargs="+", help="Nombres de parámetros a excluir (ej. xml_body)")
+
+    p_act = sub.add_parser("activate", help="Activa la versión editable en STAGING o PRODUCTION")
+    p_act.add_argument("--network", choices=["STAGING", "PRODUCTION"], default="STAGING")
+    p_act.add_argument("--emails", nargs="+", required=True, help="Emails de notificación obligatorios en Akamai")
+    p_act.add_argument("--note", default="Emergency SecOps update")
+
+    args = parser.parse_args()
+    ak = AkamaiAppSecClient()
+    ver = ak.get_editable_or_clone_version(args.config_id)
+
+    if args.cmd == "custom-rule":
+        create_and_enforce_custom_rule(ak, args.config_id, ver, args.policy_id, args.name, args.path, args.header, args.pattern)
+    elif args.cmd == "exception":
+        add_rule_exception(ak, args.config_id, ver, args.policy_id, args.rule_id, args.paths, args.params)
+    elif args.cmd == "activate":
+        activate_version(ak, args.config_id, ver, args.network, args.emails, args.note)
+```
+
+---
+
+## 7. Bloque 4: Fortinet FortiManager (Firewall Hygiene & Finder)
+
+### 7.1. Módulo Base FortiManager: `fmg_client.py`
+Gestiona sesiones JSON-RPC, soporte de API Token, bloqueo y commit de ADOM (`_workspace/lock`, `commit`, `unlock`) y copias de seguridad locales en `./fmg_backups/`.
+
+```python
+# fmg_client.py
+import os
+import json
+import requests
+import urllib3
+from datetime import datetime
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+FMG_HOST = os.getenv("FMG_HOST", "10.0.0.50")
+FMG_USER = os.getenv("FMG_USER", "admin")
+FMG_PASS = os.getenv("FMG_PASS", "tu_password")
+FMG_TOKEN = os.getenv("FMG_TOKEN", "")
+
+class FortiManagerAPI:
+    def __init__(self):
+        self.url = f"https://{FMG_HOST}/jsonrpc"
+        self.session = requests.Session()
+        self.session.verify = False
+        self.token = None
+        self.req_id = 1
+
+    def _call(self, method, params):
+        payload = {"id": self.req_id, "method": method, "params": params}
+        if self.token and not FMG_TOKEN:
+            payload["session"] = self.token
+        headers = {"Content-Type": "application/json"}
+        if FMG_TOKEN:
+            headers["Authorization"] = f"Bearer {FMG_TOKEN}"
+
+        self.req_id += 1
+        resp = self.session.post(self.url, json=payload, headers=headers, timeout=60)
+        resp.raise_for_status()
+        data = resp.json()
+        res = data.get("result", [{}])[0]
+        if res.get("status", {}).get("code", -1) != 0:
+            raise RuntimeError(f"Error FMG API: {res.get('status')}")
+        return res.get("data")
+
+    def login(self):
+        if FMG_TOKEN:
+            return
+        payload = {"id": 1, "method": "exec", "params": [{"url": "/sys/login/user", "data": {"user": FMG_USER, "passwd": FMG_PASS}}]}
+        r = self.session.post(self.url, json=payload, verify=False).json()
+        self.token = r.get("session")
+
+    def logout(self):
+        if self.token and not FMG_TOKEN:
+            self._call("exec", [{"url": "/sys/logout"}])
+
+    def lock_adom(self, adom):
+        try:
+            self._call("exec", [{"url": f"/pm/config/adom/{adom}/_workspace/lock"}])
+        except RuntimeError:
+            pass
+
+    def commit_and_unlock(self, adom):
+        try:
+            self._call("exec", [{"url": f"/pm/config/adom/{adom}/_workspace/commit"}])
+            self._call("exec", [{"url": f"/pm/config/adom/{adom}/_workspace/unlock"}])
+        except RuntimeError:
+            pass
+
+    def get_policies(self, adom, pkg):
+        url = f"/pm/config/adom/{adom}/pkg/{pkg}/firewall/policy"
+        return self._call("get", [{"url": url}]) or []
+
+def backup_package(adom, pkg, policies):
+    os.makedirs("fmg_backups", exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    fname = f"fmg_backups/{adom}_{pkg}_{ts}.json"
+    with open(fname, "w", encoding="utf-8") as f:
+        json.dump(policies, f, indent=2)
+    return fname
+```
+
+---
+
+### 7.2. Limpieza de Reglas sin Uso (`0 Hits` / Inactivas): `fmg_01_clean_unused_rules.py`
+* **Qué hace:** Detecta políticas con `0 hits` o sin uso durante más de `--days` días y las deshabilita (documentando la fecha en `comments`) o elimina.
+* **Argumentos:** `--adom`, `--pkg`, `--tag`, `--days`, `--action [disable|delete]`, `--dry-run`.
+
+```python
+# fmg_01_clean_unused_rules.py
+import argparse
+import time
+from datetime import datetime
+from fmg_client import FortiManagerAPI, backup_package
+
+def clean_unused_policies(adom, pkg, tag_filter=None, unused_days=90, action="disable", dry_run=False):
+    fmg = FortiManagerAPI()
+    fmg.login()
+
+    try:
+        policies = fmg.get_policies(adom, pkg)
+        print(f"[*] Total de políticas en '{adom}/{pkg}': {len(policies)}")
+        backup_file = backup_package(adom, pkg, policies)
+        print(f"[+] Backup guardado en: {backup_file}")
+
+        now_ts = int(time.time())
+        cutoff_seconds = unused_days * 86400
+        candidates = []
+
+        for pol in policies:
+            pid = pol.get("policyid")
+            status = pol.get("status", "enable")
+            label = pol.get("global-label", "")
+            comments = pol.get("comments", "") or ""
+
+            if tag_filter and tag_filter.lower() not in str(label).lower() and tag_filter.lower() not in comments.lower():
+                continue
+            if action == "disable" and status == "disable":
+                continue
+
+            hits = int(pol.get("_hitcount", pol.get("hit-count", 0)) or 0)
+            last_used = int(pol.get("_last_used", pol.get("last-used", 0)) or 0)
+
+            if hits == 0:
+                candidates.append((pol, "0 Hits totales"))
+            elif last_used > 0 and (now_ts - last_used) > cutoff_seconds:
+                days_ago = (now_ts - last_used) // 86400
+                candidates.append((pol, f"Sin tráfico hace {days_ago} días (> {unused_days}d)"))
+
+        print(f"[*] Detectadas {len(candidates)} reglas sin uso.")
+        if dry_run or not candidates:
+            for pol, reason in candidates:
+                print(f"  [DRY-RUN] PolicyID {pol['policyid']} ({pol.get('name')}) -> Acción: {action.upper()} | Motivo: {reason}")
+            return
+
+        fmg.lock_adom(adom)
+        today = datetime.now().strftime("%Y-%m-%d")
+
+        for pol, reason in candidates:
+            pid = pol["policyid"]
+            pol_url = f"/pm/config/adom/{adom}/pkg/{pkg}/firewall/policy/{pid}"
+
+            if action == "disable":
+                old_comment = pol.get("comments", "") or ""
+                new_comment = f"{old_comment} [AUTO-DISABLED {today}: {reason}]".strip()
+                fmg._call("update", [{"url": pol_url, "data": {"status": "disable", "comments": new_comment}}])
+                print(f"[+] PolicyID {pid} DESHABILITADA ({reason})")
+            elif action == "delete":
+                fmg._call("delete", [{"url": pol_url}])
+                print(f"[-] PolicyID {pid} ELIMINADA ({reason})")
+
+        fmg.commit_and_unlock(adom)
+    finally:
+        fmg.logout()
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Deshabilita o elimina políticas sin uso en FortiManager")
+    parser.add_argument("--adom", required=True, help="Nombre del ADOM")
+    parser.add_argument("--pkg", required=True, help="Nombre del Policy Package")
+    parser.add_argument("--tag", help="Filtrar por Policy Tag / Global Label o comentario")
+    parser.add_argument("--days", type=int, default=90, help="Días sin uso para considerar inactiva (default: 90)")
+    parser.add_argument("--action", choices=["disable", "delete"], default="disable")
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args()
+    clean_unused_policies(args.adom, args.pkg, args.tag, args.days, args.action, args.dry_run)
+```
+
+---
+
+### 7.3. Detección de Reglas en Sombra (Shadowed): `fmg_02_detect_shadow_rules.py`
+* **Qué hace:** Compara matemáticamente subredes CIDR, interfaces, servicios y horarios de arriba abajo para identificar reglas 100% solapadas por una regla superior, distinguiendo entre **Sombras Redundantes** y **Conflictos de Acción**.
+* **Argumentos:** `--adom`, `--pkg`, `--disable-redundant`.
+
+```python
+# fmg_02_detect_shadow_rules.py
+import argparse
+import ipaddress
+from fmg_client import FortiManagerAPI
+
+def as_set(val):
+    if isinstance(val, list):
+        return set(val)
+    return {val} if val else set()
+
+def load_address_subnets(fmg, adom):
+    objs = fmg._call("get", [{"url": f"/pm/config/adom/{adom}/obj/firewall/address"}]) or []
+    addr_map = {"all": [ipaddress.ip_network("0.0.0.0/0")]}
+    for o in objs:
+        name = o.get("name")
+        subnet = o.get("subnet")
+        if isinstance(subnet, list) and len(subnet) == 2:
+            try:
+                net = ipaddress.ip_network(f"{subnet[0]}/{subnet[1]}", strict=False)
+                addr_map[name] = [net]
+            except ValueError:
+                pass
+    return addr_map
+
+def is_addr_subset(sub_names, super_names, addr_map):
+    if "all" in super_names or sub_names.issubset(super_names):
+        return True
+    sub_nets = [net for name in sub_names for net in addr_map.get(name, [])]
+    super_nets = [net for name in super_names for net in addr_map.get(name, [])]
+    if not sub_nets or not super_nets:
+        return False
+    return all(any(sub_n.subnet_of(sup_n) for sup_n in super_nets) for sub_n in sub_nets)
+
+def is_field_subset(sub_set, super_set, wildcard):
+    return wildcard in super_set or sub_set.issubset(super_set)
+
+def find_shadowed_policies(adom, pkg, remove_redundant=False):
+    fmg = FortiManagerAPI()
+    fmg.login()
+
+    try:
+        policies = fmg.get_policies(adom, pkg)
+        addr_map = load_address_subnets(fmg, adom)
+        active_upper_rules = []
+        shadowed_found = []
+
+        for pol in policies:
+            if pol.get("status") == "disable":
+                continue
+
+            pid = pol["policyid"]
+            p_srcintf = as_set(pol.get("srcintf"))
+            p_dstintf = as_set(pol.get("dstintf"))
+            p_srcaddr = as_set(pol.get("srcaddr"))
+            p_dstaddr = as_set(pol.get("dstaddr"))
+            p_svc = as_set(pol.get("service"))
+            p_sched = as_set(pol.get("schedule"))
+
+            for upper in active_upper_rules:
+                if (is_field_subset(p_srcintf, upper["srcintf"], "any") and
+                    is_field_subset(p_dstintf, upper["dstintf"], "any") and
+                    is_addr_subset(p_srcaddr, upper["srcaddr"], addr_map) and
+                    is_addr_subset(p_dstaddr, upper["dstaddr"], addr_map) and
+                    is_field_subset(p_svc, upper["service"], "ALL") and
+                    is_field_subset(p_sched, upper["schedule"], "always")):
+
+                    same_action = (pol.get("action") == upper["raw"].get("action"))
+                    shadow_type = "REDUNDANTE (Misma acción)" if same_action else "CONFLICTO (Acción opuesta oculta)"
+                    shadowed_found.append({
+                        "shadowed_id": pid,
+                        "shadowed_name": pol.get("name"),
+                        "by_id": upper["id"],
+                        "by_name": upper["raw"].get("name"),
+                        "type": shadow_type,
+                        "same_action": same_action
+                    })
+                    break
+
+            active_upper_rules.append({
+                "id": pid, "srcintf": p_srcintf, "dstintf": p_dstintf,
+                "srcaddr": p_srcaddr, "dstaddr": p_dstaddr,
+                "service": p_svc, "schedule": p_sched, "raw": pol
+            })
+
+        print(f"[*] Detectadas {len(shadowed_found)} reglas en sombra (Shadowed):")
+        for s in shadowed_found:
+            print(f"  • PolicyID {s['shadowed_id']} ({s['shadowed_name']}) está tapada por PolicyID {s['by_id']} ({s['by_name']}) -> [{s['type']}]")
+
+        if remove_redundant and shadowed_found:
+            fmg.lock_adom(adom)
+            for s in shadowed_found:
+                if s["same_action"]:
+                    url = f"/pm/config/adom/{adom}/pkg/{pkg}/firewall/policy/{s['shadowed_id']}"
+                    fmg._call("update", [{"url": url, "data": {"status": "disable"}}])
+                    print(f"[+] PolicyID {s['shadowed_id']} deshabilitada por ser 100% redundante.")
+            fmg.commit_and_unlock(adom)
+    finally:
+        fmg.logout()
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Detecta reglas en sombra (Shadowed) en FortiManager")
+    parser.add_argument("--adom", required=True)
+    parser.add_argument("--pkg", required=True)
+    parser.add_argument("--disable-redundant", action="store_true", help="Deshabilita automáticamente las sombras redundantes")
+    args = parser.parse_args()
+    find_shadowed_policies(args.adom, args.pkg, remove_redundant=args.disable_redundant)
+```
+
+---
+
+### 7.4. Consolidación Segura de Políticas: `fmg_03_consolidate_policies.py`
+* **Qué hace:** Agrupa reglas equivalentes (mismas interfaces, NAT, acción y perfiles UTM) que difieren en un solo eje (`srcaddr`, `dstaddr` o `service`), deteniendo la ventana de fusión si existe una regla `DENY` intermedia.
+* **Argumentos:** `--adom`, `--pkg`, `--tag`, `--apply`.
+
+```python
+# fmg_03_consolidate_policies.py
+import argparse
+from fmg_client import FortiManagerAPI, backup_package
+
+def as_list(val):
+    if isinstance(val, list):
+        return sorted(list(set(val)))
+    return [val] if val else []
+
+def get_base_signature(pol):
+    return (
+        tuple(as_list(pol.get("srcintf"))),
+        tuple(as_list(pol.get("dstintf"))),
+        pol.get("action"), pol.get("nat"), pol.get("schedule"), pol.get("utm-status"),
+        tuple(as_list(pol.get("av-profile"))),
+        tuple(as_list(pol.get("ips-sensor"))),
+        tuple(as_list(pol.get("webfilter-profile"))),
+        tuple(as_list(pol.get("application-list"))),
+        tuple(as_list(pol.get("ssl-ssh-profile")))
+    )
+
+def consolidate_rules(adom, pkg, tag_filter=None, apply_changes=False):
+    fmg = FortiManagerAPI()
+    fmg.login()
+
+    try:
+        policies = fmg.get_policies(adom, pkg)
+        backup_package(adom, pkg, policies)
+
+        merges = []
+        skip_ids = set()
+
+        for i, pol_a in enumerate(policies):
+            if pol_a.get("status") == "disable" or pol_a["policyid"] in skip_ids:
+                continue
+            if tag_filter and tag_filter.lower() not in str(pol_a.get("global-label", "")).lower():
+                continue
+
+            sig_a = get_base_signature(pol_a)
+            a_src = set(as_list(pol_a.get("srcaddr")))
+            a_dst = set(as_list(pol_a.get("dstaddr")))
+            a_svc = set(as_list(pol_a.get("service")))
+
+            for j in range(i + 1, len(policies)):
+                pol_b = policies[j]
+                if pol_b.get("status") == "disable" or pol_b["policyid"] in skip_ids:
+                    continue
+                if pol_b.get("action") != pol_a.get("action"):
+                    if set(as_list(pol_b.get("srcintf"))) & set(as_list(pol_a.get("srcintf"))):
+                        break
+                if get_base_signature(pol_b) != sig_a:
+                    continue
+
+                b_src = set(as_list(pol_b.get("srcaddr")))
+                b_dst = set(as_list(pol_b.get("dstaddr")))
+                b_svc = set(as_list(pol_b.get("service")))
+
+                if sum([a_src != b_src, a_dst != b_dst, a_svc != b_svc]) <= 1:
+                    a_src |= b_src
+                    a_dst |= b_dst
+                    a_svc |= b_svc
+                    skip_ids.add(pol_b["policyid"])
+                    merges.append({
+                        "master_id": pol_a["policyid"],
+                        "absorbed_id": pol_b["policyid"],
+                        "new_srcaddr": sorted(list(a_src)),
+                        "new_dstaddr": sorted(list(a_dst)),
+                        "new_service": sorted(list(a_svc))
+                    })
+
+        print(f"[*] Detectadas {len(merges)} fusiones seguras de políticas:")
+        for m in merges:
+            print(f"  • Fusionar PolicyID {m['absorbed_id']} dentro de PolicyID {m['master_id']}")
+            print(f"      srcaddr: {m['new_srcaddr']} | dstaddr: {m['new_dstaddr']} | service: {m['new_service']}")
+
+        if apply_changes and merges:
+            fmg.lock_adom(adom)
+            for m in merges:
+                master_url = f"/pm/config/adom/{adom}/pkg/{pkg}/firewall/policy/{m['master_id']}"
+                absorbed_url = f"/pm/config/adom/{adom}/pkg/{pkg}/firewall/policy/{m['absorbed_id']}"
+                fmg._call("update", [{"url": master_url, "data": {"srcaddr": m["new_srcaddr"], "dstaddr": m["new_dstaddr"], "service": m["new_service"]}}])
+                fmg._call("update", [{"url": absorbed_url, "data": {"status": "disable", "comments": f"[MERGED INTO POLICY {m['master_id']}]"}}])
+            fmg.commit_and_unlock(adom)
+            print("[+] Reglas maestras actualizadas y reglas absorbidas deshabilitadas.")
+    finally:
+        fmg.logout()
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Agrupa políticas equivalentes en FortiManager")
+    parser.add_argument("--adom", required=True)
+    parser.add_argument("--pkg", required=True)
+    parser.add_argument("--tag", help="Filtrar por Policy Tag / Global Label")
+    parser.add_argument("--apply", action="store_true", help="Aplicar la fusión en FortiManager")
+    args = parser.parse_args()
+    consolidate_rules(args.adom, args.pkg, args.tag, args.apply)
+```
+
+---
+
+### 7.5. Buscador de Coincidencias y Recomendador de Reglas Candidatas: `fmg_04_smart_policy_finder.py`
+* **Qué hace:** Simula de arriba abajo qué política permite o bloquea una lista de orígenes, destinos y puertos (`Fase 1`) y, para el tráfico no permitido, recomienda qué reglas existentes se pueden ampliar calculando su afinidad por subred `/24`, puertos y orígenes (`Fase 2`).
+* **Argumentos:** `--adom`, `--pkg`, `--src <ip1> <ip2>`, `--dst <ip3> <ip4>`, `--ports <tcp/443> <udp/53>`, `--tag`.
+
+```python
+# fmg_04_smart_policy_finder.py
+import argparse
+import ipaddress
+from fmg_client import FortiManagerAPI
+
+def as_list(val):
+    if isinstance(val, list):
+        return val
+    return [val] if val else []
+
+def build_address_resolver(fmg, adom):
+    addrs = fmg._call("get", [{"url": f"/pm/config/adom/{adom}/obj/firewall/address"}]) or []
+    grps = fmg._call("get", [{"url": f"/pm/config/adom/{adom}/obj/firewall/addrgrp"}]) or []
+
+    direct_map = {"all": [ipaddress.ip_network("0.0.0.0/0")], "none": []}
+    for a in addrs:
+        name = a.get("name")
+        atype = a.get("type", "ipmask")
+        if atype in (0, "ipmask") and a.get("subnet"):
+            sub = a["subnet"]
+            try:
+                if isinstance(sub, list) and len(sub) == 2:
+                    direct_map[name] = [ipaddress.ip_network(f"{sub[0]}/{sub[1]}", strict=False)]
+                elif isinstance(sub, str):
+                    direct_map[name] = [ipaddress.ip_network(sub.replace(" ", "/"), strict=False)]
+            except ValueError:
+                pass
+        elif atype in (1, "iprange") and a.get("start-ip") and a.get("end-ip"):
+            try:
+                start = ipaddress.ip_address(a["start-ip"])
+                end = ipaddress.ip_address(a["end-ip"])
+                direct_map[name] = list(ipaddress.summarize_address_range(start, end))
+            except ValueError:
+                pass
+
+    grp_map = {g["name"]: as_list(g.get("member")) for g in grps if "name" in g}
+
+    def resolve_names(names, visited=None):
+        visited = visited or set()
+        nets = []
+        for n in names:
+            if n in visited:
+                continue
+            visited.add(n)
+            if n in direct_map:
+                nets.extend(direct_map[n])
+            elif n in grp_map:
+                nets.extend(resolve_names(grp_map[n], visited))
+        return nets
+
+    return {k: resolve_names([k]) for k in list(direct_map.keys()) + list(grp_map.keys())}
+
+def parse_port_ranges(range_str):
+    ranges = []
+    if not range_str:
+        return ranges
+    tokens = range_str if isinstance(range_str, list) else str(range_str).split()
+    for token in tokens:
+        dst_part = token.split(":")[0]
+        if "-" in dst_part:
+            p1, p2 = dst_part.split("-", 1)
+            ranges.append((int(p1), int(p2)))
+        elif dst_part.isdigit():
+            p = int(dst_part)
+            ranges.append((p, p))
+    return ranges
+
+def build_service_resolver(fmg, adom):
+    svcs = fmg._call("get", [{"url": f"/pm/config/adom/{adom}/obj/firewall/service/custom"}]) or []
+    sgrps = fmg._call("get", [{"url": f"/pm/config/adom/{adom}/obj/firewall/service/group"}]) or []
+
+    svc_map = {"ALL": {"tcp": [(1, 65535)], "udp": [(1, 65535)], "all": True}}
+    for s in svcs:
+        name = s.get("name")
+        proto = s.get("protocol", "TCP/UDP/SCTP")
+        is_all = proto in ("ALL", 6) or (not s.get("tcp-portrange") and not s.get("udp-portrange") and proto == "IP")
+        svc_map[name] = {
+            "tcp": parse_port_ranges(s.get("tcp-portrange")),
+            "udp": parse_port_ranges(s.get("udp-portrange")),
+            "all": is_all
+        }
+
+    grp_map = {g["name"]: as_list(g.get("member")) for g in sgrps if "name" in g}
+
+    def resolve_svcs(names, visited=None):
+        visited = visited or set()
+        merged = {"tcp": [], "udp": [], "all": False}
+        for n in names:
+            if n in visited:
+                continue
+            visited.add(n)
+            if n in svc_map:
+                if svc_map[n]["all"]:
+                    merged["all"] = True
+                merged["tcp"].extend(svc_map[n]["tcp"])
+                merged["udp"].extend(svc_map[n]["udp"])
+            elif n in grp_map:
+                sub = resolve_svcs(grp_map[n], visited)
+                if sub["all"]:
+                    merged["all"] = True
+                merged["tcp"].extend(sub["tcp"])
+                merged["udp"].extend(sub["udp"])
+        return merged
+
+    return {k: resolve_svcs([k]) for k in list(svc_map.keys()) + list(grp_map.keys())}
+
+def ip_matches_policy_field(ip_net, policy_field_names, addr_catalog):
+    if "all" in policy_field_names:
+        return True
+    return any(ip_net.subnet_of(net) for obj_name in policy_field_names for net in addr_catalog.get(obj_name, []))
+
+def ip_shares_similar_subnet(ip_net, policy_field_names, addr_catalog, prefix_mask=24):
+    if "all" in policy_field_names or ip_net.prefixlen < prefix_mask:
+        return False
+    target_supernet = ip_net.supernet(new_prefix=prefix_mask)
+    return any(net.prefixlen >= prefix_mask and net.overlaps(target_supernet) for obj_name in policy_field_names for net in addr_catalog.get(obj_name, []))
+
+def port_matches_policy_field(proto, port, policy_svc_names, svc_catalog):
+    if "ALL" in policy_svc_names:
+        return True
+    for s_name in policy_svc_names:
+        s_data = svc_catalog.get(s_name)
+        if s_data and (s_data["all"] or any(p_min <= port <= p_max for p_min, p_max in s_data.get(proto.lower(), []))):
+            return True
+    return False
+
+def parse_requested_port(p_str):
+    if "/" in p_str:
+        proto, port = p_str.split("/", 1)
+        return proto.lower(), int(port)
+    return "tcp", int(p_str)
+
+def analyze_traffic_request(adom, pkg, req_srcs, req_dsts, req_ports, tag_filter=None):
+    fmg = FortiManagerAPI()
+    fmg.login()
+
+    try:
+        policies = fmg.get_policies(adom, pkg)
+        addr_catalog = build_address_resolver(fmg, adom)
+        svc_catalog = build_service_resolver(fmg, adom)
+
+        src_nets = [ipaddress.ip_network(s, strict=False) for s in req_srcs]
+        dst_nets = [ipaddress.ip_network(d, strict=False) for d in req_dsts]
+        parsed_ports = [parse_requested_port(p) for p in req_ports]
+
+        print("\n======================================================================")
+        print(" FASE 1: SIMULACIÓN SECUENCIAL TOP-DOWN (¿QUÉ REGLA HACE MATCH HOY?)")
+        print("======================================================================")
+
+        unpermitted_flows = []
+
+        for s_net in src_nets:
+            for d_net in dst_nets:
+                for proto, port in parsed_ports:
+                    matched_rule = None
+                    for idx, pol in enumerate(policies):
+                        if pol.get("status") == "disable":
+                            continue
+                        if (ip_matches_policy_field(s_net, as_list(pol.get("srcaddr")), addr_catalog) and
+                            ip_matches_policy_field(d_net, as_list(pol.get("dstaddr")), addr_catalog) and
+                            port_matches_policy_field(proto, port, as_list(pol.get("service")), svc_catalog)):
+                            matched_rule = (idx + 1, pol)
+                            break
+
+                    flow_str = f"{s_net} -> {d_net} [{proto.upper()}/{port}]"
+                    if matched_rule:
+                        pos, r = matched_rule
+                        action = r.get("action", "deny").upper()
+                        pid = r.get("policyid")
+                        rname = r.get("name", f"ID_{pid}")
+                        if action == "ACCEPT":
+                            print(f"  [PERMITIDO] {flow_str} ==> Match en Posición #{pos}: PolicyID {pid} ('{rname}')")
+                        else:
+                            print(f"  [BLOQUEADO] {flow_str} ==> DENY explícito en Posición #{pos}: PolicyID {pid} ('{rname}')")
+                            unpermitted_flows.append((s_net, d_net, proto, port, pos))
+                    else:
+                        print(f"  [DENEGADO]  {flow_str} ==> Sin coincidencia (Cae en Implicit Deny final)")
+                        unpermitted_flows.append((s_net, d_net, proto, port, len(policies) + 1))
+
+        if not unpermitted_flows:
+            print("\n[+] Todo el tráfico solicitado YA ESTÁ PERMITIDO por las políticas actuales.")
+            return
+
+        print("\n======================================================================")
+        print(" FASE 2: BÚSQUEDA DE REGLAS CANDIDATAS PARA AMPLIAR / CONSOLIDAR")
+        print("======================================================================")
+
+        candidates = []
+
+        for idx, pol in enumerate(policies):
+            if pol.get("status") == "disable" or pol.get("action") != "accept":
+                continue
+            if tag_filter and tag_filter.lower() not in str(pol.get("global-label", "")).lower():
+                continue
+
+            pid = pol["policyid"]
+            p_srcs = as_list(pol.get("srcaddr"))
+            p_dsts = as_list(pol.get("dstaddr"))
+            p_svcs = as_list(pol.get("service"))
+
+            if "all" in p_srcs and "all" in p_dsts:
+                continue
+
+            src_exact = sum(1 for s in src_nets if ip_matches_policy_field(s, p_srcs, addr_catalog))
+            src_subnet = sum(1 for s in src_nets if not ip_matches_policy_field(s, p_srcs, addr_catalog) and ip_shares_similar_subnet(s, p_srcs, addr_catalog))
+            dst_exact = sum(1 for d in dst_nets if ip_matches_policy_field(d, p_dsts, addr_catalog))
+            dst_subnet = sum(1 for d in dst_nets if not ip_matches_policy_field(d, p_dsts, addr_catalog) and ip_shares_similar_subnet(d, p_dsts, addr_catalog))
+            port_exact = sum(1 for proto, port in parsed_ports if port_matches_policy_field(proto, port, p_svcs, svc_catalog))
+
+            r_src = src_exact / len(src_nets)
+            r_dst = dst_exact / len(dst_nets)
+            r_port = port_exact / len(parsed_ports)
+            r_dst_sim = (dst_exact + dst_subnet) / len(dst_nets)
+            r_src_sim = (src_exact + src_subnet) / len(src_nets)
+
+            reasons = []
+            score = 0
+
+            if r_port > 0 and (r_dst > 0 or r_dst_sim > 0):
+                score += (r_port * 40) + (r_dst * 35) + ((r_dst_sim - r_dst) * 20) + (r_src * 25)
+                if r_port == 1.0 and r_dst > 0:
+                    reasons.append(f"Ya usa los mismos puertos ({port_exact}/{len(parsed_ports)}) hacia {dst_exact}/{len(dst_nets)} de los destinos")
+                elif r_port > 0 and dst_subnet > 0:
+                    reasons.append(f"Ya abre esos puertos hacia servidores de la misma subred /24 que tus destinos ({dst_subnet} coincidencias)")
+
+            if r_src > 0 and r_port > 0:
+                score = max(score, (r_src * 45) + (r_port * 40) + (r_dst * 15))
+                reasons.append(f"Ya incluye {src_exact}/{len(src_nets)} orígenes y {port_exact}/{len(parsed_ports)} puertos solicitados")
+
+            if (r_src > 0 or r_src_sim > 0) and (r_dst > 0 or r_dst_sim > 0) and r_port < 1.0:
+                score = max(score, (r_src * 45) + (r_dst * 45) + (r_port * 10))
+                reasons.append(f"Ya comunica orígenes ({src_exact}/{len(src_nets)}) con destinos ({dst_exact}/{len(dst_nets)}) en otros puertos")
+
+            if score < 35:
+                continue
+
+            missing_srcs = [str(s) for s in src_nets if not ip_matches_policy_field(s, p_srcs, addr_catalog)]
+            missing_dsts = [str(d) for d in dst_nets if not ip_matches_policy_field(d, p_dsts, addr_catalog)]
+            missing_ports = [f"{pr.upper()}/{po}" for pr, po in parsed_ports if not port_matches_policy_field(pr, po, p_svcs, svc_catalog)]
+            blocked_above = any((idx + 1) > deny_pos for _, _, _, _, deny_pos in unpermitted_flows)
+
+            candidates.append({
+                "pos": idx + 1, "id": pid, "name": pol.get("name", f"ID_{pid}"),
+                "score": round(min(score, 99.0), 1), "srcintf": as_list(pol.get("srcintf")),
+                "dstintf": as_list(pol.get("dstintf")), "reasons": list(dict.fromkeys(reasons)),
+                "missing_src": missing_srcs, "missing_dst": missing_dsts,
+                "missing_port": missing_ports, "blocked_above": blocked_above
+            })
+
+        candidates.sort(key=lambda x: x["score"], reverse=True)
+
+        if not candidates:
+            print("  [-] No se encontraron políticas candidatas con afinidad suficiente. Se recomienda crear una regla nueva.")
+            return
+
+        for c in candidates[:8]:
+            warn = " [¡ATENCIÓN: Hay una regla DENY por encima de esta posición!]" if c["blocked_above"] else ""
+            print(f"\n  ★ CANDIDATA PolicyID {c['id']} ('{c['name']}') | Posición #{c['pos']} | Afinidad: {c['score']}%{warn}")
+            print(f"    Interfaces : {c['srcintf']} -> {c['dstintf']}")
+            print(f"    Motivos    : {' | '.join(c['reasons'])}")
+            acciones = []
+            if c["missing_src"]:
+                acciones.append(f"Añadir a srcaddr: {c['missing_src']}")
+            if c["missing_dst"]:
+                acciones.append(f"Añadir a dstaddr: {c['missing_dst']}")
+            if c["missing_port"]:
+                acciones.append(f"Añadir a service: {c['missing_port']}")
+            print(f"    Cambio req.: {' ; '.join(acciones)}")
+    finally:
+        fmg.logout()
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Busca políticas que permiten/deniegan un tráfico y sugiere reglas candidatas para ampliar")
+    parser.add_argument("--adom", required=True, help="Nombre del ADOM")
+    parser.add_argument("--pkg", required=True, help="Nombre del Policy Package")
+    parser.add_argument("--src", nargs="+", required=True, help="IPs o subredes origen (ej. 10.10.1.15 10.10.2.0/24)")
+    parser.add_argument("--dst", nargs="+", required=True, help="IPs o subredes destino (ej. 192.168.50.10 192.168.50.12)")
+    parser.add_argument("--ports", nargs="+", required=True, help="Puertos requeridos (ej. tcp/443 tcp/8443 udp/53)")
+    parser.add_argument("--tag", help="Filtrar candidatas por Policy Tag / Global Label")
+    args = parser.parse_args()
+    analyze_traffic_request(args.adom, args.pkg, args.src, args.dst, args.ports, args.tag)
+```
