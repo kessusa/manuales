@@ -1,0 +1,15 @@
+Input
+sid: Playflows session ID.
+tag: list of firewall tags to check, e.g. ['…CIS-KONDOR', '…CIS-FXO', '…CIS-ADMIN'].
+source / destination / service: strings separated by ;, e.g. "10.94.249.150;10.94.249.157", "10.94.224.64/26", "tcp-5986".
+node_name_list: for each IP or subnet, its node name and the firewall that protects it.
+Output
+One entry per (flow, firewall): the rule that matches the flow, plus the source/destination node names.
+If the API call fails, it returns None.
+Logic
+It builds every source × destination × service combination as "src dst srv".
+It sends those flows to Playflows /match-flows, using the upcoming policy version.
+From the response it keeps only active rules: type match-flow and not disabled.
+It keeps a rule only if it lives on the firewall protecting the source or the destination. That firewall comes from node_name_list.
+For each flow on each firewall, it keeps the rule with the lowest position. Firewalls read rules from top to bottom, so that is the rule that actually applies.
+Example: 10.94.249.150 → 10.94.224.64/26 tcp-5986 crosses ADMIN (on the source side) and FXO (on the destination side), so the result has the first matching rule on each of those two firewalls
