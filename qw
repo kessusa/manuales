@@ -1,0 +1,285 @@
+# `PlayflowsAPI.match_flow` — how it works
+
+**What it answers:** for each flow (source → destination → service) in a ticket, which firewall rule actually matches it on each firewall the traffic passes through.
+
+**Short version:** build every src/dst/srv combination, ask Playflows which rules match them, keep only rules that are active and sit on a firewall that protects the source or the destination, then keep the **first matching rule (lowest position)** per flow and per firewall.
+
+---
+
+## 0. Real example used in this document
+
+This is taken from a real ticket proposal (`ajax_load_data_ticket_proposal` in `rss/views.py`). These values are what the view prints right before it calls `match_flow`.
+
+| Variable in the view | Value |
+|---|---|
+| `source_str` | `10.94.249.150;10.94.249.157;10.94.249.153;10.94.249.151` |
+| `destination_str` | `10.94.224.64/26;10.94.228.128/25` |
+| `service_str` | `tcp-5986` |
+| `fw_policies` (→ `tag`) | `['EMEA_FR_PRD_DMZA_CIS-KONDOR', 'EMEA_FR_PRD_DMZA_CIS-FXO', 'EMEA_FR_PRD_DMZA_CIS-ADMIN']` |
+| `fw_and_node_info.values()` (→ `node_name_list`) | see the table below |
+
+`node_name_list` maps each IP or subnet to its node name and to the firewall that protects it:
+
+| `ip_address` | `node_normalization` (node name) | `firewall_misc` (protecting firewall) |
+|---|---|---|
+| 10.94.249.150 | EMEA_FR_PRD_CIS_ADMINTOOLS_SAN | EMEA_FR_PRD_DMZA_CIS-ADMIN |
+| 10.94.249.157 | EMEA_FR_PRD_CIS_ADMINTOOLS_SAN | EMEA_FR_PRD_DMZA_CIS-ADMIN |
+| 10.94.249.153 | EMEA_FR_PRD_CIS_ADMINTOOLS_SAN | EMEA_FR_PRD_DMZA_CIS-ADMIN |
+| 10.94.249.151 | EMEA_FR_PRD_CIS_ADMINTOOLS_SAN | EMEA_FR_PRD_DMZA_CIS-ADMIN |
+| 10.94.224.64/26 | EMEA_FR_PRD_CIS_APPL_FXO | EMEA_FR_PRD_DMZA_CIS-FXO |
+| 10.94.228.128/25 | EMEA_FR_PRD_CIS_PRES_KONDOR | EMEA_FR_PRD_DMZA_CIS-KONDOR |
+
+So all 4 sources sit behind the **ADMIN** firewall. One destination is behind **FXO** and the other is behind **KONDOR**.
+
+---
+
+## 1. Method inputs
+
+```python
+def match_flow(self, sid, tag, source, destination, service, node_name_list):
+```
+
+| Parameter | Type | Meaning | Example value |
+|---|---|---|---|
+| `sid` | str | Playflows session ID | `"<session id>"` |
+| `tag` | list[str] | Firewall tags to search in | the 3 tags above (KONDOR, FXO, ADMIN) |
+| `source` | str, `;`-separated | Source IPs or subnets | `"10.94.249.150;10.94.249.157;10.94.249.153;10.94.249.151"` |
+| `destination` | str, `;`-separated | Destination IPs or subnets | `"10.94.224.64/26;10.94.228.128/25"` |
+| `service` | str, `;`-separated | Services | `"tcp-5986"` |
+| `node_name_list` | iterable of dicts | IP → node name → protecting firewall | the 6 dicts above |
+
+---
+
+## 2. Step 1 — Build every flow (cartesian product)
+
+```python
+flows = [f'{src} {dst} {srv}' for src, dst, srv in
+         product(source.split(';'), destination.split(';'), service.split(';'))]
+```
+
+**In:** 3 `;`-separated strings.
+**Out:** a list of `"src dst srv"` strings, one for each combination.
+
+In the example that is 4 sources × 2 destinations × 1 service = **8 flows**:
+
+```
+10.94.249.150 10.94.224.64/26  tcp-5986
+10.94.249.150 10.94.228.128/25 tcp-5986
+10.94.249.157 10.94.224.64/26  tcp-5986
+10.94.249.157 10.94.228.128/25 tcp-5986
+10.94.249.153 10.94.224.64/26  tcp-5986
+10.94.249.153 10.94.228.128/25 tcp-5986
+10.94.249.151 10.94.224.64/26  tcp-5986
+10.94.249.151 10.94.228.128/25 tcp-5986
+```
+
+---
+
+## 3. Step 2 — Call Playflows `/match-flows`
+
+```python
+params = {
+    'sid': sid,
+    'flows': flows,
+    'tags': tag,
+    'version': 'upcoming',
+    'flavours': 'use-manual-filter'
+}
+self.connection_args['json'] = params
+response = requests.post(f'{self.base_url}/match-flows', **self.connection_args)
+```
+
+**In:** the 8 flows and the 3 firewall tags.
+**What Playflows does:** for each flow and each firewall, it looks at the rulebase and returns the rules that match. It uses the `upcoming` version of the policy, so pending changes are included.
+**Out:** an HTTP response. Its JSON has a `data` list, and each item is one rule that matched.
+
+Of the fields in each item, the method only uses `type`, `action`, `flow`, `position` and `tag`. Every other field is copied into the result unchanged.
+
+> If `status_code != 200`, the method returns **`None`**.
+
+### Illustrative `data` (made-up response, used to show the filters)
+
+The rule names and positions below are invented. The real response depends on the rulebase.
+
+| # | `type` | `action` | `flow` | `tag` | `position` |
+|---|---|---|---|---|---|
+| A | match-flow | accept | 10.94.249.150 10.94.224.64/26 tcp-5986 | CIS-ADMIN | 120 |
+| B | match-flow | accept | 10.94.249.150 10.94.224.64/26 tcp-5986 | CIS-ADMIN | 45 |
+| C | match-flow | accept | 10.94.249.150 10.94.224.64/26 tcp-5986 | CIS-FXO | 300 |
+| D | match-flow | accept | 10.94.249.157 10.94.228.128/25 tcp-5986 | CIS-FXO | 10 |
+| E | match-flow | disabled | 10.94.249.153 10.94.228.128/25 tcp-5986 | CIS-KONDOR | 5 |
+| F | *(other type)* | … | … | … | … |
+
+(The tag prefix `EMEA_FR_PRD_DMZA_` is left out to keep the table readable.)
+
+---
+
+## 4. Step 3 — Filter each item
+
+For every `item` in `response['data']`:
+
+### 3a. Keep only active matches
+
+```python
+if item['type'] == 'match-flow' and not 'disabled' in item['action']:
+```
+
+**In:** one item. **Out:** the item continues to the next check, or is dropped.
+→ **E** is dropped because the rule is disabled. **F** is dropped because its type is not `match-flow`.
+
+### 3b. Read the main fields
+
+```python
+flow = item['flow']
+position = int(item['position'])   # rule order in the firewall rulebase (lower = evaluated first)
+current_fw_tag = item['tag']       # firewall where this rule lives
+src, dst, srv = item['flow'].split()   # if it does not split into exactly 3 parts → skip (ValueError)
+```
+
+Example for **A**: `src='10.94.249.150'`, `dst='10.94.224.64/26'`, `srv='tcp-5986'`, `position=120`, `current_fw_tag='…CIS-ADMIN'`.
+
+### 3c. Find the firewalls protecting the source and the destination
+
+```python
+norm_src, norm_dst = normalize_ip(src), normalize_ip(dst)
+src_fw_misc = next((n['firewall_misc'].strip() for n in node_name_list if n['ip_address'] == norm_src), None)
+dst_fw_misc = next((n['firewall_misc'].strip() for n in node_name_list if n['ip_address'] == norm_dst), None)
+```
+
+**In:** src/dst from the flow, plus `node_name_list`.
+**Out:** the name of the firewall in front of the source and the one in front of the destination (`None` if the IP is not in the list).
+
+`normalize_ip` puts the IP in the same format used in `node_name_list` so that the exact `==` comparison works.
+
+Example for **A**: `src_fw_misc = …CIS-ADMIN`, `dst_fw_misc = …CIS-FXO`.
+
+### 3d. Keep only rules on a firewall that is in the path
+
+```python
+if current_fw_tag not in (src_fw_misc, dst_fw_misc):
+    continue
+```
+
+The rule is kept only if it lives on the source's firewall or the destination's firewall.
+
+| Item | Rule's firewall | src fw | dst fw | Result |
+|---|---|---|---|---|
+| A | ADMIN | ADMIN | FXO | ✅ kept |
+| B | ADMIN | ADMIN | FXO | ✅ kept |
+| C | FXO | ADMIN | FXO | ✅ kept |
+| D | FXO | ADMIN | KONDOR | ❌ dropped (FXO is not in the path of this flow) |
+
+---
+
+## 5. Step 4 — Keep the first matching rule per (flow, firewall)
+
+```python
+flow_key = (flow, current_fw_tag)
+
+if flow_key not in min_flow_result or position < int(min_flow_result[flow_key]['position']):
+    min_flow_result[flow_key] = {
+        **item,
+        'source': src,
+        'source_node_name': <node_normalization of src>,
+        'destination': dst,
+        'destination_node_name': <node_normalization of dst>,
+        'service': srv,
+    }
+```
+
+**In:** each item that passed the filters.
+**Out:** the dict `min_flow_result`, which keeps **one entry per (flow, firewall)**: the rule with the **lowest position**.
+
+A firewall evaluates its rules from top to bottom, so the rule with the lowest position is the one that actually applies to the traffic.
+
+Example:
+
+| `flow_key` | Candidates | Winner |
+|---|---|---|
+| (`10.94.249.150 10.94.224.64/26 tcp-5986`, ADMIN) | A (120), B (45) | **B** (45 < 120) |
+| (`10.94.249.150 10.94.224.64/26 tcp-5986`, FXO) | C (300) | **C** |
+
+Each winner is enriched with the node names taken from `node_name_list`:
+- `source_node_name` = `EMEA_FR_PRD_CIS_ADMINTOOLS_SAN`
+- `destination_node_name` = `EMEA_FR_PRD_CIS_APPL_FXO`
+
+> The `else:` branch (appending extra src/dst/srv to an existing entry) never does anything in practice. See the observations at the end.
+
+---
+
+## 6. Method output
+
+```python
+return min_flow_result.values()
+```
+
+| Case | Return value |
+|---|---|
+| HTTP ≠ 200 | `None` |
+| HTTP 200, no `data` or nothing passes the filters | empty `dict_values([])` |
+| HTTP 200 with matches | `dict_values` with one dict per (flow, firewall) |
+
+Output for the example:
+
+```python
+dict_values([
+    {   # winner on the ADMIN firewall (source side)
+        **<all original fields of item B>,
+        'type': 'match-flow', 'action': 'accept', 'position': 45,
+        'tag': 'EMEA_FR_PRD_DMZA_CIS-ADMIN',
+        'flow': '10.94.249.150 10.94.224.64/26 tcp-5986',
+        'source': '10.94.249.150',
+        'source_node_name': 'EMEA_FR_PRD_CIS_ADMINTOOLS_SAN',
+        'destination': '10.94.224.64/26',
+        'destination_node_name': 'EMEA_FR_PRD_CIS_APPL_FXO',
+        'service': 'tcp-5986',
+    },
+    {   # winner on the FXO firewall (destination side)
+        **<all original fields of item C>,
+        'position': 300,
+        'tag': 'EMEA_FR_PRD_DMZA_CIS-FXO',
+        'flow': '10.94.249.150 10.94.224.64/26 tcp-5986',
+        'source': '10.94.249.150',
+        'source_node_name': 'EMEA_FR_PRD_CIS_ADMINTOOLS_SAN',
+        'destination': '10.94.224.64/26',
+        'destination_node_name': 'EMEA_FR_PRD_CIS_APPL_FXO',
+        'service': 'tcp-5986',
+    },
+])
+```
+
+**How to read it:** the flow `10.94.249.150 → 10.94.224.64/26 tcp-5986` crosses two firewalls. On ADMIN it is matched first by the rule at position 45, and on FXO by the rule at position 300. Flows with no row in the output have no active matching rule on any firewall in their path, so they may need a new rule.
+
+---
+
+## 7. Full pipeline
+
+```
+source / destination / service (";" strings)
+        │  product()
+        ▼
+8 flows "src dst srv"
+        │  POST /match-flows (sid, flows, tags, upcoming)
+        ▼
+response['data']  → one item per matching rule
+        │  filter: type == match-flow, not disabled, flow splits into 3
+        │  filter: rule's firewall ∈ {firewall of src, firewall of dst}
+        ▼
+group by (flow, firewall) → keep the lowest position
+        │  enrich with source/destination node names
+        ▼
+dict_values([...])  (or None if HTTP ≠ 200)
+```
+
+---
+
+## 8. Observations (possible improvements)
+
+1. **The `else:` branch is dead code.** `flow_key` contains the full flow string (`src dst srv`), so two items with the same key always have the same src, dst and srv. The checks `src not in …['source']`, `dst not in …` and `srv not in …` are always False, so nothing is ever appended.
+2. **That branch would crash if it ever ran.**
+   - `source`, `destination`, `service` and `source_node_name` are stored as **strings**, so `.append()` would raise `AttributeError`.
+   - It uses the key `'destination_node'`, but the key that is created is `'destination_node_name'`, so it would raise `KeyError`.
+3. **The return type is `dict_values`, not a list.** It cannot be indexed and is not JSON-serializable. `list(min_flow_result.values())` would be safer for callers.
+4. **IP matching is an exact string comparison.** If `normalize_ip(dst)` and the `ip_address` in `node_name_list` are formatted differently (for example `/32` versus no mask), `*_fw_misc` becomes `None` and the rule is silently dropped. A host IP that sits inside a subnet in the list is not matched either.
+5. **Shared state is modified.** `self.connection_args['json'] = params` changes the instance's state. If the same `PlayflowsAPI` object is used concurrently, the payload of one call could leak into another.
+6. **No error handling.** Missing keys in an item (`type`, `action`, `position`, `tag`) would raise an exception for the whole call, and a non-200 response is not logged.
