@@ -1,0 +1,406 @@
+# EMEAPLAYFLOWS-3989 — Nueva categoría "File Transfer"
+
+## Qué pide el ticket
+
+En la parte *Routed* del Firewall Rules Review hay reglas que en realidad son de transferencia de ficheros y deben ir a su propia categoría, **File Transfer**:
+
+- El TAG contiene `DMZI_PRES` y **no** contiene `BASTION`.
+- SRC o DST contiene una de las IPs de la lista.
+- Y SRC o DST tiene un objeto cuyo nombre empieza por `EXT`.
+- Nota del ticket: "this should be done negatively to remove the list from ROUTED". Es decir, estas reglas **dejan de ser Ext-Routed**.
+
+## Enfoque (mismo patrón que External Routed)
+
+| Pieza | External Routed (ya existe) | File Transfer (nuevo) |
+|---|---|---|
+| Flag en el modelo | `PlayflowsRule.external_routed` | `PlayflowsRule.file_transfer` |
+| Condición SQL | `EXTERNAL_ROUTED_SQL` en `utils/sql_filter.py` | `FILE_TRANSFER_SQL` en `utils/sql_filter.py` |
+| Cálculo | `playflows_tag` → `.extra(where=[...])` + `update()` | Igual, en el mismo bloque |
+| Categoría | `if rule.external_routed` | `if rule.file_transfer` |
+
+Las condiciones simples (región, tag) van en el ORM con `filter`/`exclude`. Lo que necesita recorrer arrays JSON (IPs y nombres de objeto) va en SQL. Las categorías no calculan nada: solo leen el flag.
+
+## Antes de empezar
+
+- Crea una rama nueva: `feature/EMEAPLAYFLOWS-3989-file-transfer-category`.
+- Los cambios de external routed que tienes sin commitear en `bugfix/EMEAPLAYFLOWS-3976-...` deberían ir a esta rama (o a la suya), no a la de FRIDA.
+
+---
+
+## 1. Modelo — `rss/models.py`
+
+**Dónde:** en la clase `PlayflowsRule`, justo debajo de `external_routed`.
+
+```python
+file_transfer = models.BooleanField(default=False)
+```
+
+**Por qué:** igual que `external_routed`, guardamos el resultado del cálculo en la propia regla. Así las páginas y el comando de categorías solo leen un booleano, sin repetir consultas pesadas en cada request.
+
+**Migración:**
+
+```bash
+python manage.py makemigrations rss -n playflows_rule_file_transfer
+python manage.py migrate
+```
+
+El `default=False` hace que las reglas existentes queden a `False` hasta la siguiente ejecución de `playflows_tag`.
+
+---
+
+## 2. SQL — `utils/sql_filter.py`
+
+**Dónde:** al final del fichero, debajo de `EXTERNAL_ROUTED_SQL`. Reutiliza `_IP_REGEX`, que ya está definido arriba.
+
+```python
+FILE_TRANSFER_IPS = [
+    '10.243.244.115',
+    '10.243.244.176',
+    '10.243.244.206',
+    '10.243.245.37',
+    '10.243.245.144',
+    '10.243.245.146',
+    '10.243.245.238',
+    '10.243.245.239',
+    '10.243.245.253',
+    '10.243.252.53',
+    '10.243.252.58',
+    '10.243.253.6',
+    '10.243.253.62',
+    '155.140.135.61'
+]
+
+_file_transfer_values = ", ".join(f"'{ip}/32'::cidr" for ip in FILE_TRANSFER_IPS)
+
+FILE_TRANSFER_SQL = f"""
+(
+    (
+        /* ---------- SOURCE OR DESTINATION FILE TRANSFER IP ---------- */
+        (
+            "pf_rule"."source" IS NOT NULL
+            AND EXISTS (
+                SELECT 1
+                FROM jsonb_array_elements_text(
+                    CASE WHEN jsonb_typeof("pf_rule"."source") = 'array'
+                        THEN "pf_rule"."source"
+                        ELSE jsonb_build_array("pf_rule"."source")
+                    END
+                ) AS src(txt)
+                WHERE src.txt ~ '{_IP_REGEX}'
+                AND (src.txt)::inet <<= ANY(ARRAY[{_file_transfer_values}])
+            )
+        )
+        OR
+        (
+            "pf_rule"."destination" IS NOT NULL
+            AND EXISTS (
+                SELECT 1
+                FROM jsonb_array_elements_text(
+                    CASE WHEN jsonb_typeof("pf_rule"."destination") = 'array'
+                        THEN "pf_rule"."destination"
+                        ELSE jsonb_build_array("pf_rule"."destination")
+                    END
+                ) AS dst(txt)
+                WHERE dst.txt ~ '{_IP_REGEX}'
+                AND (dst.txt)::inet <<= ANY(ARRAY[{_file_transfer_values}])
+            )
+        )
+    )
+    AND
+    (
+        /* ---------- SOURCE OR DESTINATION OBJECT STARTS WITH EXT ---------- */
+        (
+            "pf_rule"."source_names" IS NOT NULL
+            AND EXISTS (
+                SELECT 1
+                FROM jsonb_array_elements_text(
+                    CASE WHEN jsonb_typeof("pf_rule"."source_names") = 'array'
+                        THEN "pf_rule"."source_names"
+                        ELSE jsonb_build_array("pf_rule"."source_names")
+                    END
+                ) AS src_name(txt)
+                WHERE left(upper(src_name.txt), 3) = 'EXT'
+            )
+        )
+        OR
+        (
+            "pf_rule"."destination_names" IS NOT NULL
+            AND EXISTS (
+                SELECT 1
+                FROM jsonb_array_elements_text(
+                    CASE WHEN jsonb_typeof("pf_rule"."destination_names") = 'array'
+                        THEN "pf_rule"."destination_names"
+                        ELSE jsonb_build_array("pf_rule"."destination_names")
+                    END
+                ) AS dst_name(txt)
+                WHERE left(upper(dst_name.txt), 3) = 'EXT'
+            )
+        )
+    )
+)
+"""
+```
+
+**Qué hace cada parte:**
+
+- `FILE_TRANSFER_IPS`: la lista del ticket sin duplicados (el ticket repite varias IPs; quedan 14). Si mañana hay que añadir una, solo se toca esta lista.
+- `_file_transfer_values`: convierte cada IP en `'x.x.x.x/32'::cidr`, igual que `_cidr_values` hace con los rangos internos.
+- Bloque de IPs: misma estructura que `EXTERNAL_ROUTED_SQL`.
+  - El `CASE jsonb_typeof` acepta que `source`/`destination` sean array o valor suelto.
+  - El regex evita castear a `inet` cosas que no son IPs, como nombres o `any`.
+  - `<<= ANY(...)` comprueba si la IP está dentro de alguna de la lista. Al usar `/32`, vale tanto `10.243.244.115` como `10.243.244.115/32`.
+- Bloque de objetos EXT: mismo recorrido sobre `source_names` y `destination_names`. Hay coincidencia si algún nombre empieza por `EXT`, sin distinguir mayúsculas.
+  - Se usa `left(...) = 'EXT'` en lugar de `LIKE 'EXT%'` para no tener que escapar el `%` dentro de `.extra()`.
+- Los dos bloques se unen con `AND`: hace falta una IP de la lista **y** un objeto EXT.
+
+**Supuesto a comprobar:** que `source_names` y `destination_names` son columnas jsonb como `source`. Si son de otro tipo, hay que adaptar el `jsonb_array_elements_text`.
+
+---
+
+## 3. Cálculo — `rss/management/commands/playflows_tag.py`
+
+### 3.1 Import
+
+**Dónde:** línea 20, donde ya se importa `EXTERNAL_ROUTED_SQL`.
+
+```python
+from utils.sql_filter import EXTERNAL_ROUTED_SQL, FILE_TRANSFER_SQL
+```
+
+### 3.2 Quitar el tag de pruebas
+
+**Dónde:** en `handle`, alrededor de la línea 235.
+
+Antes:
+
+```python
+#tag_list = obj_playflows.get_tags(sid=sid)
+tag_list = ['EMEA_UK_PRD_CORE_MKT-ETS']
+```
+
+Después:
+
+```python
+tag_list = obj_playflows.get_tags(sid=sid)
+```
+
+**Por qué:** con el tag fijo, el sync solo procesa una política. No puede subir así.
+
+### 3.3 Sustituir el bloque "External routed rules"
+
+**Dónde:** en `handle`, desde `# # External routed rules` hasta el bucle que hace `update(external_routed=True)` (líneas 374–394 aprox.). Todo ese bloque se reemplaza por:
+
+```python
+        # # File transfer rules
+        file_transfer_ids = list(
+            PlayflowsRule.objects.filter(
+                tag__region=region,
+                tag__tag_name__contains='DMZI_PRES'
+            ).exclude(
+                tag__tag_name__contains='BASTION'
+            ).extra(where=[FILE_TRANSFER_SQL]).distinct().values_list('rule_id', flat=True)
+        )
+
+        # # External routed rules
+        queryset_ids = PlayflowsRule.objects.filter(tag__region=region).exclude(
+            Q(section__startswith="NETSEC:")
+            | Q(section__startswith="INFRA:")
+            | Q(section="RED BUTTON")
+            | Q(section="RED_BUTTON")
+            | Q(section__icontains="red button")
+            | Q(section__icontains="END DROP")
+            | Q(action__icontains='encrypt')
+            | Q(action__icontains='nat')
+            | Q(rule_id__in=file_transfer_ids)
+        ).extra(where=[EXTERNAL_ROUTED_SQL]).distinct().values_list('rule_id', flat=True)
+
+        # We convert it into a list to 'fix' the result and release the database cursor
+        ids_to_update = list(queryset_ids)
+
+        # Reset both flags and set them again in small batches
+        # This avoids locking the table for too long and saturating the memory
+        BATCH_SIZE = 1000
+        with transaction.atomic():
+            PlayflowsRule.objects.filter(tag__region=region).update(
+                external_routed=False,
+                file_transfer=False
+            )
+            for i in range(0, len(ids_to_update), BATCH_SIZE):
+                batch = ids_to_update[i: i + BATCH_SIZE]
+                PlayflowsRule.objects.filter(rule_id__in=batch).update(external_routed=True)
+            for i in range(0, len(file_transfer_ids), BATCH_SIZE):
+                batch = file_transfer_ids[i: i + BATCH_SIZE]
+                PlayflowsRule.objects.filter(rule_id__in=batch).update(file_transfer=True)
+```
+
+**Qué hace cada parte:**
+
+- **File transfer rules (va primero):**
+  - Las condiciones del tag (`DMZI_PRES` sí, `BASTION` no) van en el ORM, igual que las exclusiones de `section` y `action` de external routed.
+  - Las IPs y los objetos EXT se resuelven con `FILE_TRANSFER_SQL`.
+  - Se convierte a lista porque se usa dos veces: para excluir de routed y para marcar el flag.
+- **`Q(rule_id__in=file_transfer_ids)` en el exclude de routed:** es el "negatively" del ticket. Una regla de File Transfer nunca se marca como Ext-Routed.
+- **Reset a `False` dentro del `atomic`:**
+  - Antes nunca se desmarcaba nada, así que una regla que dejaba de ser externa seguía saliendo como Ext-Routed. Con este ticket importa aún más: las reglas de File Transfer ya marcadas como routed se quedarían en las dos categorías.
+  - El `atomic` evita que, mientras se recalcula, alguien vea la región con todo a `False`.
+- **Los dos bucles por lotes:** mantienen el `BATCH_SIZE = 1000` y el estilo que ya había.
+
+---
+
+## 4. Categorías
+
+Hay dos `get_rule_categories` y los dos tienen que conocer la nueva categoría.
+
+### 4.1 `rss/management/commands/playflows_rules_categories.py`
+
+**Dónde:** en `get_rule_categories` (la del Firewall Rules Review), justo después del `if rule.external_routed:` (línea 51 aprox.).
+
+```python
+    if rule.external_routed:
+        rule_categories.append("Ext-Routed")
+    if rule.file_transfer:
+        rule_categories.append("File Transfer")
+    return rule_categories
+```
+
+Actualiza también el docstring de esa función: `8 categories` → `9 categories`.
+
+### 4.2 `rss/management/commands/playflows_tag.py`
+
+**Dónde:** en su `get_rule_categories` (línea 55 aprox.), mismo cambio.
+
+```python
+    if rule.external_routed:
+        rule_categories.append("Ext-Routed")
+    if rule.file_transfer:
+        rule_categories.append("File Transfer")
+    if rule.is_wide_rule:
+        rule_categories.append("Wide Rule")
+    return rule_categories
+```
+
+**Por qué:** las categorías solo leen flags ya calculados, como hacen con `external_routed`. No hace falta `elif`: el cálculo del punto 3 ya garantiza que una regla no tiene los dos flags a la vez.
+
+**Efecto esperado:** en la primera ejecución de `playflows_rules_categories` tras el cambio, las reglas afectadas generan una entrada nueva en `PlayflowsRuleCategoryHistory`, porque sus categorías cambian. Es lo esperado.
+
+### 4.3 Filtro en la página (revisar)
+
+Si la lista de categorías del filtro del Firewall Rules Review está escrita a mano en un template o una vista, hay que añadir `File Transfer` ahí para que aparezca como opción. Si se construye a partir de las categorías guardadas, no hay que tocar nada.
+
+---
+
+## 5. Tests
+
+**Dónde:** en la carpeta de tests de la app `rss`, por ejemplo `rss/tests/test_playflows_file_transfer.py`.
+
+```python
+from types import SimpleNamespace
+
+from django.test import SimpleTestCase
+
+from rss.management.commands.playflows_rules_categories import get_rule_categories
+
+
+def build_rule(**overrides):
+    values = {
+        'fk_rule_content': SimpleNamespace(all=lambda: []),
+        'action': 'accept',
+        'status': 'enable',
+        'hits': 10,
+        'fp_rule': False,
+        'tag': SimpleNamespace(tag_name='EMEA_UK_PRD_DMZI_PRES_APP'),
+        'source': [],
+        'destination': [],
+        'external_routed': False,
+        'file_transfer': False,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+class FileTransferCategoryTests(SimpleTestCase):
+
+    def test_file_transfer_rule_gets_its_own_category(self):
+        categories = get_rule_categories(build_rule(file_transfer=True))
+        self.assertIn('File Transfer', categories)
+        self.assertNotIn('Ext-Routed', categories)
+
+    def test_routed_rule_keeps_ext_routed(self):
+        categories = get_rule_categories(build_rule(external_routed=True))
+        self.assertIn('Ext-Routed', categories)
+        self.assertNotIn('File Transfer', categories)
+
+    def test_regular_rule_has_neither_category(self):
+        categories = get_rule_categories(build_rule())
+        self.assertNotIn('Ext-Routed', categories)
+        self.assertNotIn('File Transfer', categories)
+```
+
+**Por qué:** comprueban que las categorías leen bien los flags y que una regla de File Transfer no sale como Ext-Routed. Usan `SimpleNamespace` en lugar de modelos, así que no necesitan base de datos y son rápidos.
+
+```bash
+python manage.py test rss.tests.test_playflows_file_transfer
+```
+
+---
+
+## 6. Validación en STG
+
+El SQL hay que validarlo contra datos reales de STG (nunca PROD).
+
+1. Lanza el sync de una región:
+
+   ```bash
+   python manage.py playflows_tag --region emea
+   ```
+
+2. Comprueba los flags en el shell de Django (`python manage.py shell`):
+
+   ```python
+   from rss.models import PlayflowsRule
+
+   rules = PlayflowsRule.objects.filter(tag__region='emea')
+
+   # Must be > 0 if there are DMZI_PRES rules using these IPs
+   rules.filter(file_transfer=True).count()
+
+   # Must be 0: no rule can be in both categories
+   rules.filter(file_transfer=True, external_routed=True).count()
+
+   # Must be 0: BASTION tags are excluded
+   rules.filter(file_transfer=True, tag__tag_name__contains='BASTION').count()
+
+   # Spot check a few rules by hand
+   for rule in rules.filter(file_transfer=True)[:5]:
+       print(rule.tag.tag_name, rule.source, rule.destination,
+             rule.source_names, rule.destination_names)
+   ```
+
+3. Lanza las categorías y revisa la página del Firewall Rules Review:
+
+   ```bash
+   python manage.py playflows_rules_categories --region emea
+   ```
+
+---
+
+## 7. Pendiente de confirmar con quien abrió el ticket
+
+- **Lado de la IP y del EXT.** Ahora vale cualquier combinación: la IP puede estar en SRC o DST, y el objeto EXT también. Si tienen que estar en lados opuestos (IP en un lado, EXT en el otro), se cambia el `AND` central del SQL por dos combinaciones cruzadas.
+- **`EXT` en el nombre del objeto.** He interpretado "starts with EXT" sobre los nombres de objeto (`source_names` / `destination_names`), no sobre las IPs.
+
+## 8. Limitación conocida (compartida con External Routed)
+
+El regex `_IP_REGEX` acepta valores como `999.1.1.1`. Si alguna regla trae un valor así, el cast `::inet` falla y la consulta entera da error. Ya pasaba con `EXTERNAL_ROUTED_SQL`; si quieres cerrarlo, se puede endurecer el regex en un ticket aparte.
+
+## Checklist
+
+- [ ] Rama `feature/EMEAPLAYFLOWS-3989-...`
+- [ ] Campo `file_transfer` + migración
+- [ ] `FILE_TRANSFER_IPS`, `_file_transfer_values` y `FILE_TRANSFER_SQL` en `utils/sql_filter.py`
+- [ ] Import, tag de pruebas eliminado y bloque nuevo en `playflows_tag.py`
+- [ ] Categoría en los dos `get_rule_categories` + docstring
+- [ ] Filtro de la página revisado
+- [ ] Tests en verde
+- [ ] Validación en STG
+- [ ] Dudas del punto 7 resueltas
